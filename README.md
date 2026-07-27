@@ -13,13 +13,45 @@ Using `lazy.nvim`:
 ```lua
 {
   "alzeck/agentic-flow.nvim",
+  dependencies = {
+    {
+      "folke/snacks.nvim",
+      opts = {
+        picker = { enabled = true },
+      },
+    },
+  },
   config = function()
-    require("agentic-flow").setup()
+    require("agentic-flow").setup({
+      base = "origin/main",
+      picker = {},
+    })
   end,
 }
 ```
 
-There are no user-facing commands yet.
+## Changed files
+
+Open a searchable, file-grouped diff against the configured base:
+
+```vim
+:AgenticFlowChanges
+```
+
+Override the base for one invocation:
+
+```vim
+:AgenticFlowChanges origin/develop
+```
+
+The same view is available from Lua:
+
+```lua
+require("agentic-flow").changes({ base = "origin/develop" })
+```
+
+Options under `picker` are passed to the Snacks picker, allowing its layout and
+presentation to be customized.
 
 ## Development
 

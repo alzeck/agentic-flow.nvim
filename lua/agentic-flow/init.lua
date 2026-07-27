@@ -1,6 +1,9 @@
 local M = {}
 
-local defaults = {}
+local defaults = {
+  base = "origin/main",
+  picker = {},
+}
 local config = vim.deepcopy(defaults)
 
 ---Configure agentic-flow.nvim.
@@ -16,6 +19,13 @@ end
 ---@return table
 function M.get_config()
   return vim.deepcopy(config)
+end
+
+---Open the changed-files picker.
+---@param opts? table
+---@return table?
+function M.changes(opts)
+  return require("agentic-flow.picker").changes(config, opts)
 end
 
 return M
