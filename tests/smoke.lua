@@ -8,6 +8,7 @@ package.preload["snacks"] = function()
           opts = opts,
           closed = false,
           refreshed = false,
+          main = vim.api.nvim_get_current_win(),
         }
         function picker:close()
           self.closed = true
@@ -63,6 +64,11 @@ write(root .. "/tracked.txt", { "alpha", "target", "omega" })
 write(root .. "/staged.txt", { "base" })
 write(root .. "/deleted.txt", { "deleted base line" })
 write(root .. "/rename-old.txt", { "rename me" })
+local chunk_lines = {}
+for index = 1, 20 do
+  chunk_lines[index] = ("chunk line %d"):format(index)
+end
+write(root .. "/chunks.txt", chunk_lines)
 run(root, "git", "add", ".")
 run(root, "git", "commit", "-m", "base")
 run(root, "git", "branch", "upstream")
@@ -72,6 +78,10 @@ write(root .. "/committed.txt", { "Binary files support file-level notes." })
 run(root, "git", "add", "committed.txt")
 run(root, "git", "commit", "-m", "feature commit")
 write(root .. "/tracked.txt", { "ALPHA", "target", "omega" })
+local changed_chunk_lines = vim.deepcopy(chunk_lines)
+changed_chunk_lines[2] = "changed chunk two"
+changed_chunk_lines[18] = "changed chunk eighteen"
+write(root .. "/chunks.txt", changed_chunk_lines)
 write(root .. "/staged.txt", { "staged change" })
 run(root, "git", "add", "staged.txt")
 assert(vim.uv.fs_unlink(root .. "/deleted.txt"))
@@ -96,6 +106,24 @@ assert_equal(
 agentic_flow.setup({
   base = "upstream",
   clipboard = "a",
+})
+local sidebar_picker = assert(agentic_flow.changes({ root = root }))
+assert_equal(
+  sidebar_picker.opts.layout,
+  { preset = "sidebar", preview = false },
+  "changes should open in a sidebar by default"
+)
+assert_equal(sidebar_picker.opts.focus, "list", "the sidebar should focus the changed-file list")
+assert_equal(sidebar_picker.opts.auto_close, false, "the sidebar should stay open while reviewing")
+assert_equal(
+  sidebar_picker.opts.jump,
+  { close = false },
+  "opening a file should preserve the review sidebar"
+)
+
+agentic_flow.setup({
+  base = "upstream",
+  clipboard = "a",
   picker = { layout = "vertical" },
   comments_picker = { layout = "ivy" },
 })
@@ -103,6 +131,12 @@ agentic_flow.setup({
 local config = agentic_flow.get_config()
 assert_equal(config.base, "upstream", "setup should retain the configured base")
 assert_equal(config.picker.layout, "vertical", "setup should retain picker configuration")
+assert_equal(config.signs.unreviewed, "▎", "unreviewed chunks should have a default gutter sign")
+assert_equal(
+  config.display.unreviewed_chunks,
+  true,
+  "unreviewed chunk highlighting should be enabled by default"
+)
 config.base = "mutated"
 assert_equal(agentic_flow.get_config().base, "upstream", "get_config should return a copy")
 
@@ -117,6 +151,7 @@ for _, change in ipairs(context.changes) do
   statuses[change.file] = change.status
 end
 assert_equal(statuses["committed.txt"], "A", "committed branch changes should be included")
+assert_equal(statuses["chunks.txt"], "M", "files with multiple chunks should be included")
 assert_equal(statuses["tracked.txt"], "M", "unstaged changes should be included")
 assert_equal(statuses["staged.txt"], "M", "staged changes should be included")
 assert_equal(statuses["deleted.txt"], "D", "deleted files should be included")
@@ -125,6 +160,63 @@ assert_equal(statuses["untracked.txt"], "?", "untracked files should be included
 assert_equal(statuses["binary.dat"], "?", "untracked binary files should be included")
 assert(context.by_file["binary.dat"].binary, "binary files should be detected")
 assert(not context.by_file["committed.txt"].binary, "binary prose in a text diff must stay textual")
+assert_equal(#context.by_file["binary.dat"].hunks, 0, "binary files should remain file-level")
+local binary_chunk, binary_chunk_error = review.toggle_chunk_reviewed(
+  agentic_flow.get_config(),
+  { context = context, file = "binary.dat", line = 1 }
+)
+assert(binary_chunk == nil, "binary files should not expose textual chunk review")
+assert(
+  type(binary_chunk_error) == "string" and binary_chunk_error:find("no textual", 1, true),
+  "file-level-only changes should explain why chunk review is unavailable"
+)
+assert_equal(
+  #context.by_file["chunks.txt"].hunks,
+  2,
+  "separate diffs should produce separate chunks"
+)
+assert_equal(
+  context.by_file["chunks.txt"].hunks[1].changed_lines,
+  { 2 },
+  "chunks should record exact changed current-side lines"
+)
+assert_equal(
+  context.by_file["chunks.txt"].hunks[2].changed_lines,
+  { 18 },
+  "later chunks should retain their current-side location"
+)
+
+local shifted_hunks = git.parse_hunks(table.concat({
+  "@@ -10,2 +20,2 @@",
+  "-old",
+  "+new",
+  " context",
+}, "\n"))
+local original_hunks = git.parse_hunks(table.concat({
+  "@@ -1,2 +1,2 @@",
+  "-old",
+  "+new",
+  " context",
+}, "\n"))
+assert_equal(
+  shifted_hunks[1].fingerprint,
+  original_hunks[1].fingerprint,
+  "chunk fingerprints should ignore line-number movement"
+)
+local duplicate_hunks = git.parse_hunks(table.concat({
+  "@@ -1,2 +1,2 @@",
+  "-old",
+  "+new",
+  " context",
+  "@@ -10,2 +10,2 @@",
+  "-old",
+  "+new",
+  " context",
+}, "\n"))
+assert(
+  duplicate_hunks[1].fingerprint ~= duplicate_hunks[2].fingerprint,
+  "duplicate chunk bodies should receive distinct fingerprints"
+)
 
 local changes_picker = assert(agentic_flow.changes({ root = root }))
 assert_equal(
@@ -133,7 +225,7 @@ assert_equal(
   "changes should use the review picker"
 )
 assert_equal(changes_picker.opts.layout, "vertical", "changes should pass through picker options")
-assert_equal(#changes_picker.opts.items, 7, "the picker should contain one item per changed file")
+assert_equal(#changes_picker.opts.items, 8, "the picker should contain one item per changed file")
 assert(
   changes_picker.opts.title:find("Review vs upstream", 1, true),
   "the title should show the base"
@@ -141,6 +233,215 @@ assert(
 assert(
   changes_picker.opts.actions.agentic_toggle_reviewed,
   "the picker should expose review actions"
+)
+local committed_item
+for _, item in ipairs(changes_picker.opts.items) do
+  if item.change.file == "committed.txt" then
+    committed_item = item
+  end
+end
+assert(committed_item, "the committed file should be available in the review sidebar")
+changes_picker.opts.confirm(changes_picker, committed_item)
+vim.wait(1000, function()
+  return vim.b.agentic_flow_path == "committed.txt"
+end)
+assert(not changes_picker.closed, "opening a file should keep the review sidebar open")
+assert_equal(
+  vim.b.agentic_flow_path,
+  "committed.txt",
+  "selecting a sidebar item should open it in the main window"
+)
+
+local function chunk_marks(buf)
+  local namespace = vim.api.nvim_get_namespaces()["agentic-flow-chunks"]
+  return vim.api.nvim_buf_get_extmarks(buf, namespace, 0, -1, { details = true })
+end
+
+local function mark_counts(buf)
+  local highlights = 0
+  local signs = 0
+  for _, mark in ipairs(chunk_marks(buf)) do
+    local details = mark[4]
+    if details.line_hl_group == "AgenticFlowUnreviewed" then
+      highlights = highlights + 1
+    end
+    if details.sign_text then
+      signs = signs + 1
+    end
+  end
+  return highlights, signs
+end
+
+local chunks_buf =
+  assert(review.open_change(agentic_flow.get_config(), context, context.by_file["chunks.txt"]))
+local chunk_highlights, chunk_signs = mark_counts(chunks_buf)
+assert_equal(chunk_highlights, 2, "every unreviewed chunk should tint its changed lines")
+assert_equal(chunk_signs, 2, "every unreviewed chunk should receive one gutter marker")
+
+local first_chunk = assert(agentic_flow.toggle_chunk_reviewed({
+  root = root,
+  base = "upstream",
+  file = "chunks.txt",
+  line = 2,
+  buf = chunks_buf,
+}))
+assert_equal(first_chunk.reviewed, 1, "one chunk should be reviewed")
+assert_equal(first_chunk.total, 2, "chunk progress should include every file chunk")
+assert(changes_picker.refreshed, "chunk toggles should refresh the persistent review sidebar")
+local refreshed_chunk_item
+for _, item in ipairs(changes_picker.opts.items) do
+  if item.change.file == "chunks.txt" then
+    refreshed_chunk_item = item
+  end
+end
+assert(refreshed_chunk_item, "the refreshed sidebar should retain the chunked file")
+assert_equal(
+  refreshed_chunk_item.review_status,
+  "partial",
+  "the open sidebar should receive partial state immediately"
+)
+context = first_chunk.context
+local chunk_status, _, reviewed_hunks, hunk_count = review.file_status(context, "chunks.txt")
+assert_equal(chunk_status, "partial", "partly reviewed files should expose a partial state")
+assert_equal({ reviewed_hunks, hunk_count }, { 1, 2 }, "partial progress should be counted")
+chunk_highlights, chunk_signs = mark_counts(chunks_buf)
+assert_equal(chunk_highlights, 1, "reviewed chunks should lose their background tint")
+assert_equal(chunk_signs, 1, "reviewed chunks should lose their gutter marker")
+local hidden_config = agentic_flow.get_config()
+hidden_config.display.unreviewed_chunks = false
+require("agentic-flow.ui").attach(hidden_config, context, "chunks.txt", chunks_buf)
+assert_equal(#chunk_marks(chunks_buf), 0, "chunk decoration should be configurable")
+require("agentic-flow.ui").attach(agentic_flow.get_config(), context, "chunks.txt", chunks_buf)
+
+local partial_picker = assert(agentic_flow.changes({ root = root, base = "upstream" }))
+local partial_item
+for _, item in ipairs(partial_picker.opts.items) do
+  if item.change.file == "chunks.txt" then
+    partial_item = item
+  end
+end
+assert(partial_item, "the partial file should remain in the review sidebar")
+assert_equal(partial_item.review_status, "partial", "the sidebar should retain partial state")
+local partial_format = partial_picker.opts.format(partial_item)
+assert_equal(partial_format[1][1], "◐ ", "partial files should use a distinct icon")
+assert(
+  partial_format[4][1]:find("1/2 chunks", 1, true),
+  "partial rows should display reviewed chunk progress"
+)
+
+local second_chunk = assert(agentic_flow.toggle_chunk_reviewed({
+  root = root,
+  base = "upstream",
+  file = "chunks.txt",
+  line = 18,
+  buf = chunks_buf,
+}))
+assert_equal(second_chunk.reviewed, 2, "reviewing the last chunk should complete the file")
+assert_equal(
+  review.file_status(second_chunk.context, "chunks.txt"),
+  "reviewed",
+  "all chunks complete"
+)
+assert_equal(#chunk_marks(chunks_buf), 0, "completed files should have no chunk decoration")
+
+vim.api.nvim_buf_set_lines(chunks_buf, 17, 18, false, { "changed chunk eighteen again" })
+vim.api.nvim_buf_call(chunks_buf, function()
+  vim.cmd.write()
+end)
+context = assert(review.resolve(agentic_flow.get_config(), { root = root, base = "upstream" }))
+chunk_status, _, reviewed_hunks, hunk_count = review.file_status(context, "chunks.txt")
+assert_equal(chunk_status, "partial", "editing one reviewed chunk should preserve unchanged chunks")
+assert_equal(
+  { reviewed_hunks, hunk_count },
+  { 1, 2 },
+  "only the changed chunk should return to review"
+)
+require("agentic-flow.ui").attach(agentic_flow.get_config(), context, "chunks.txt", chunks_buf)
+
+vim.api.nvim_win_set_buf(0, chunks_buf)
+vim.api.nvim_win_set_cursor(0, { 2, 0 })
+local next_chunk = assert(agentic_flow.next_unreviewed({ root = root, base = "upstream" }))
+assert_equal(next_chunk.file, "chunks.txt", "navigation should find later chunks in the same file")
+assert_equal(vim.api.nvim_win_get_cursor(0)[1], 18, "navigation should jump to the chunk anchor")
+local next_file = assert(agentic_flow.next_unreviewed({ root = root, base = "upstream" }))
+assert_equal(next_file.file, "committed.txt", "navigation should continue into the next file")
+local previous_chunk = assert(agentic_flow.prev_unreviewed({ root = root, base = "upstream" }))
+assert_equal(previous_chunk.file, "chunks.txt", "previous navigation should cross file boundaries")
+assert_equal(vim.api.nvim_win_get_cursor(0)[1], 18, "previous navigation should restore the chunk")
+
+vim.api.nvim_buf_set_lines(chunks_buf, 17, 18, false, { "unsaved chunk edit" })
+local unsaved_chunk, unsaved_error = review.toggle_chunk_reviewed(agentic_flow.get_config(), {
+  root = root,
+  base = "upstream",
+  file = "chunks.txt",
+  line = 18,
+  buf = chunks_buf,
+})
+assert(unsaved_chunk == nil, "modified chunks should not be markable as reviewed")
+assert(
+  type(unsaved_error) == "string" and unsaved_error:find("save the buffer", 1, true),
+  "modified chunk errors should explain how to continue"
+)
+vim.api.nvim_buf_set_lines(chunks_buf, 17, 18, false, { "changed chunk eighteen again" })
+vim.bo[chunks_buf].modified = false
+
+local bulk_chunks = assert(agentic_flow.toggle_reviewed({
+  root = root,
+  base = "upstream",
+  file = "chunks.txt",
+}))
+assert_equal(bulk_chunks.status, "reviewed", "file toggles should review every current chunk")
+assert_equal(
+  { review.hunk_progress(bulk_chunks.context, "chunks.txt") },
+  { 2, 2 },
+  "bulk review should persist all chunk fingerprints"
+)
+bulk_chunks = assert(agentic_flow.toggle_reviewed({
+  root = root,
+  base = "upstream",
+  file = "chunks.txt",
+}))
+assert_equal(bulk_chunks.status, "pending", "a second file toggle should reset every chunk")
+assert_equal(
+  { review.hunk_progress(bulk_chunks.context, "chunks.txt") },
+  { 0, 2 },
+  "bulk reset should clear all chunk fingerprints"
+)
+local wrapped_next = assert(review.navigate_unreviewed(agentic_flow.get_config(), {
+  root = root,
+  base = "upstream",
+  file = "untracked.txt",
+  line = 1,
+}, "next"))
+assert_equal(wrapped_next.file, "chunks.txt", "next navigation should wrap to the first chunk")
+assert_equal(vim.api.nvim_win_get_cursor(0)[1], 2, "wrapped navigation should use the first anchor")
+local wrapped_previous = assert(review.navigate_unreviewed(agentic_flow.get_config(), {
+  context = wrapped_next.context,
+  file = "chunks.txt",
+  line = 2,
+}, "previous"))
+assert_equal(
+  wrapped_previous.file,
+  "untracked.txt",
+  "previous navigation should wrap to the final chunk"
+)
+local partial_before_edit = assert(review.toggle_chunk_reviewed(agentic_flow.get_config(), {
+  root = root,
+  base = "upstream",
+  file = "chunks.txt",
+  line = 2,
+  buf = chunks_buf,
+}))
+assert_equal(partial_before_edit.reviewed, 1, "one reviewed chunk should restore partial state")
+vim.api.nvim_buf_set_lines(chunks_buf, 1, 2, false, { "changed chunk two again" })
+vim.api.nvim_buf_call(chunks_buf, function()
+  vim.cmd.write()
+end)
+context = assert(review.resolve(agentic_flow.get_config(), { root = root, base = "upstream" }))
+assert_equal(
+  review.file_status(context, "chunks.txt"),
+  "invalidated",
+  "editing the only reviewed chunk in a partial file should expose invalidation"
 )
 
 local tracked_buf = vim.fn.bufadd(root .. "/tracked.txt")
@@ -287,6 +588,9 @@ assert_equal(
   "deleted files should open their base contents"
 )
 assert(vim.bo[deleted_buf].readonly, "deleted-file buffers should be read-only")
+local deleted_highlights, deleted_signs = mark_counts(deleted_buf)
+assert_equal(deleted_highlights, 1, "deleted-file buffers should tint changed old-side lines")
+assert_equal(deleted_signs, 1, "deleted-file chunks should retain a gutter marker")
 
 local branch_before = git.branch(root)
 assert(
@@ -314,6 +618,62 @@ assert_equal(
 )
 
 local storage_dir = assert(git.storage_dir(root))
+run(root, "git", "branch", "legacy-upstream", "upstream")
+local legacy_key = vim.fn.sha256("feature\0legacy-upstream")
+local legacy_path = storage_dir .. "/reviews/" .. legacy_key .. ".json"
+local legacy_context =
+  assert(review.resolve(agentic_flow.get_config(), { root = root, base = "legacy-upstream" }))
+write(legacy_path, {
+  vim.json.encode({
+    version = 1,
+    branch = "feature",
+    base = "legacy-upstream",
+    next_comment_id = 1,
+    files = {
+      ["chunks.txt"] = {
+        comments = {},
+        reviewed = true,
+        fingerprint = legacy_context.by_file["chunks.txt"].fingerprint,
+      },
+    },
+  }),
+})
+legacy_context =
+  assert(review.resolve(agentic_flow.get_config(), { root = root, base = "legacy-upstream" }))
+assert_equal(
+  review.file_status(legacy_context, "chunks.txt"),
+  "reviewed",
+  "matching v1 file review state should migrate to reviewed chunks"
+)
+assert_equal(
+  { review.hunk_progress(legacy_context, "chunks.txt") },
+  { 2, 2 },
+  "v1 migration should seed every current chunk fingerprint"
+)
+local migrated = assert(vim.json.decode(table.concat(vim.fn.readfile(legacy_path), "\n")))
+assert_equal(migrated.version, 2, "migrated review state should use schema version 2")
+assert(migrated._migrated_from == nil, "migration metadata should not be persisted")
+for _, change in ipairs(legacy_context.changes) do
+  if review.file_status(legacy_context, change.file) ~= "reviewed" then
+    assert(review.toggle_reviewed(agentic_flow.get_config(), {
+      context = legacy_context,
+      file = change.file,
+    }))
+    legacy_context =
+      assert(review.resolve(agentic_flow.get_config(), { root = root, base = "legacy-upstream" }))
+  end
+end
+local no_chunk, no_chunk_error = review.navigate_unreviewed(
+  agentic_flow.get_config(),
+  { context = legacy_context, file = "chunks.txt", line = 1 },
+  "next"
+)
+assert(no_chunk == nil, "navigation should stop when every textual chunk is reviewed")
+assert(
+  type(no_chunk_error) == "string" and no_chunk_error:find("no unreviewed", 1, true),
+  "completed-review navigation should report that no chunks remain"
+)
+
 local corrupt_key = vim.fn.sha256("feature\0corrupt")
 local corrupt_path = storage_dir .. "/reviews/" .. corrupt_key .. ".json"
 write(corrupt_path, { "{not json" })
@@ -375,6 +735,9 @@ for _, command in ipairs({
   "AgenticFlowChanges",
   "AgenticFlowBase",
   "AgenticFlowToggleReviewed",
+  "AgenticFlowToggleChunkReviewed",
+  "AgenticFlowNextUnreviewed",
+  "AgenticFlowPrevUnreviewed",
   "AgenticFlowComment",
   "AgenticFlowFileComment",
   "AgenticFlowComments",

@@ -13,9 +13,11 @@ local defaults = {
   signs = {
     comment = "●",
     stale = "!",
+    unreviewed = "▎",
   },
   display = {
     virtual_text = true,
+    unreviewed_chunks = true,
   },
 }
 local config = vim.deepcopy(defaults)
@@ -39,6 +41,20 @@ local function refresh_buffer(buf)
   })
   if context then
     ui.attach(config, context, vim.b[buf].agentic_flow_path, buf)
+    require("agentic-flow.picker").refresh_changes(context)
+  end
+end
+
+local function refresh_context_buffers(context, file)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if
+      vim.api.nvim_buf_is_valid(buf)
+      and vim.api.nvim_buf_is_loaded(buf)
+      and vim.b[buf].agentic_flow_root == context.root
+      and vim.b[buf].agentic_flow_path == file
+    then
+      ui.attach(config, context, file, buf)
+    end
   end
 end
 
@@ -116,9 +132,60 @@ function M.toggle_reviewed(opts)
   util.notify(
     ("%s is %s"):format(result.file, result.status == "reviewed" and "reviewed" or "back in review")
   )
-  local buf = opts and opts.buf or vim.api.nvim_get_current_buf()
-  refresh_buffer(buf)
+  refresh_context_buffers(result.context, result.file)
+  require("agentic-flow.picker").refresh_changes(result.context)
   return result
+end
+
+---Toggle reviewed state for the chunk under the cursor.
+---@param opts? table
+---@return table?
+function M.toggle_chunk_reviewed(opts)
+  local result, err = review.toggle_chunk_reviewed(config, opts or {})
+  if not result then
+    notify_error(err)
+    return nil
+  end
+  local action = result.status == "reviewed" and "Chunk reviewed" or "Chunk returned to review"
+  util.notify(("%s · %d/%d chunks reviewed"):format(action, result.reviewed, result.total))
+  refresh_context_buffers(result.context, result.file)
+  require("agentic-flow.picker").refresh_changes(result.context)
+  return result
+end
+
+local function navigate_unreviewed(direction, opts)
+  opts = opts or {}
+  if not opts.context then
+    local active = review.active()
+    local buf = opts.buf or vim.api.nvim_get_current_buf()
+    if
+      active
+      and vim.b[buf].agentic_flow_root == active.root
+      and vim.b[buf].agentic_flow_base == active.base
+    then
+      opts = vim.tbl_extend("force", {}, opts, { context = active })
+    end
+  end
+  local result, err = review.navigate_unreviewed(config, opts, direction)
+  if not result then
+    notify_error(err)
+    return nil
+  end
+  return result
+end
+
+---Open the next unreviewed chunk, wrapping across files.
+---@param opts? table
+---@return table?
+function M.next_unreviewed(opts)
+  return navigate_unreviewed("next", opts)
+end
+
+---Open the previous unreviewed chunk, wrapping across files.
+---@param opts? table
+---@return table?
+function M.prev_unreviewed(opts)
+  return navigate_unreviewed("previous", opts)
 end
 
 local function comment_file(context, opts)

@@ -3,7 +3,8 @@ local util = require("agentic-flow.util")
 
 local M = {}
 
-local namespace = vim.api.nvim_create_namespace("agentic-flow-comments")
+local comment_namespace = vim.api.nvim_create_namespace("agentic-flow-comments")
+local chunk_namespace = vim.api.nvim_create_namespace("agentic-flow-chunks")
 
 local function comment_label(comment)
   local first = vim.split(comment.text or "", "\n", { plain = true })[1] or ""
@@ -11,12 +12,53 @@ local function comment_label(comment)
   return first ~= "" and first or "Comment"
 end
 
+local function chunk_lines(change, hunk)
+  if change.status == "D" then
+    return hunk.old_changed_lines, hunk.old_anchor
+  end
+  return hunk.changed_lines, hunk.changed_lines[1] or hunk.deletion_anchors[1] or hunk.anchor
+end
+
+local function decorate_chunks(config, context, file, buf)
+  vim.api.nvim_buf_clear_namespace(buf, chunk_namespace, 0, -1)
+  if config.display.unreviewed_chunks == false then
+    return
+  end
+  local change = context.by_file[file]
+  if not change or #(change.hunks or {}) == 0 then
+    return
+  end
+
+  local line_count = math.max(1, vim.api.nvim_buf_line_count(buf))
+  for _, hunk in ipairs(change.hunks) do
+    if not review.hunk_reviewed(context, file, hunk) then
+      local changed_lines, marker_line = chunk_lines(change, hunk)
+      for _, line in ipairs(changed_lines) do
+        if line >= 1 and line <= line_count then
+          vim.api.nvim_buf_set_extmark(buf, chunk_namespace, line - 1, 0, {
+            line_hl_group = "AgenticFlowUnreviewed",
+            priority = 40,
+          })
+        end
+      end
+      marker_line = math.max(1, math.min(marker_line or 1, line_count))
+      vim.api.nvim_buf_set_extmark(buf, chunk_namespace, marker_line - 1, 0, {
+        sign_text = config.signs.unreviewed,
+        sign_hl_group = "AgenticFlowUnreviewed",
+        number_hl_group = "AgenticFlowUnreviewed",
+        priority = 50,
+      })
+    end
+  end
+end
+
 local function decorate(config, context, file, buf)
   if not vim.api.nvim_buf_is_valid(buf) or not vim.api.nvim_buf_is_loaded(buf) then
     return
   end
 
-  vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
+  decorate_chunks(config, context, file, buf)
+  vim.api.nvim_buf_clear_namespace(buf, comment_namespace, 0, -1)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   review.relocate_comments(context, file, lines)
 
@@ -39,7 +81,7 @@ local function decorate(config, context, file, buf)
 
   local virtual_text = config.display.virtual_text ~= false
   if #file_comments > 0 then
-    vim.api.nvim_buf_set_extmark(buf, namespace, 0, 0, {
+    vim.api.nvim_buf_set_extmark(buf, comment_namespace, 0, 0, {
       virt_text = virtual_text
           and {
             {
@@ -66,7 +108,7 @@ local function decorate(config, context, file, buf)
       label = "stale · " .. label
     end
     local highlight = stale and "AgenticFlowStale" or "AgenticFlowComment"
-    vim.api.nvim_buf_set_extmark(buf, namespace, line - 1, 0, {
+    vim.api.nvim_buf_set_extmark(buf, comment_namespace, line - 1, 0, {
       sign_text = stale and config.signs.stale or config.signs.comment,
       sign_hl_group = highlight,
       virt_text = virtual_text and { { "  " .. label, highlight } } or nil,
@@ -167,6 +209,8 @@ function M.setup_highlights()
   vim.api.nvim_set_hl(0, "AgenticFlowStale", { default = true, link = "DiagnosticWarn" })
   vim.api.nvim_set_hl(0, "AgenticFlowReviewed", { default = true, link = "DiagnosticOk" })
   vim.api.nvim_set_hl(0, "AgenticFlowPending", { default = true, link = "Comment" })
+  vim.api.nvim_set_hl(0, "AgenticFlowPartial", { default = true, link = "DiagnosticHint" })
+  vim.api.nvim_set_hl(0, "AgenticFlowUnreviewed", { default = true, link = "DiffChange" })
 end
 
 return M

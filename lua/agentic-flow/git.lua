@@ -118,10 +118,6 @@ local function untracked_patch(file, contents)
   return table.concat(patch, "\n") .. "\n", false
 end
 
-local function first_changed_line(patch)
-  return tonumber(patch:match("@@.-%+(%d+)")) or 1
-end
-
 local function binary_patch(patch)
   for _, line in ipairs(util.split_lines(patch)) do
     if line == "GIT binary patch" or line:match("^Binary files .+ differ$") then
@@ -129,6 +125,99 @@ local function binary_patch(patch)
     end
   end
   return false
+end
+
+local function hunk_range(start, count)
+  if count == 0 then
+    return math.max(1, start), math.max(1, start)
+  end
+  return math.max(1, start), math.max(1, start + count - 1)
+end
+
+local function unique_numbers(values)
+  local result = {}
+  local seen = {}
+  for _, value in ipairs(values) do
+    if not seen[value] then
+      seen[value] = true
+      result[#result + 1] = value
+    end
+  end
+  return result
+end
+
+local function finish_hunk(hunks, hunk)
+  if not hunk or (#hunk.changed_lines == 0 and #hunk.old_changed_lines == 0) then
+    return
+  end
+  hunk.deletion_anchors = unique_numbers(hunk.deletion_anchors)
+  hunk.old_cursor_start, hunk.old_cursor_end = hunk_range(hunk.old_start, hunk.old_count)
+  hunk.new_cursor_start, hunk.new_cursor_end = hunk_range(hunk.new_start, hunk.new_count)
+  hunks[#hunks + 1] = hunk
+end
+
+---Parse standard unified-diff hunks.
+---@param patch string
+---@return table[]
+function M.parse_hunks(patch)
+  local hunks = {}
+  local current
+  local old_line
+  local new_line
+
+  for _, line in ipairs(util.split_lines(patch)) do
+    local old_start, old_count, new_start, new_count =
+      line:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
+    if old_start then
+      finish_hunk(hunks, current)
+      old_start = tonumber(old_start)
+      new_start = tonumber(new_start)
+      old_count = old_count == "" and 1 or tonumber(old_count)
+      new_count = new_count == "" and 1 or tonumber(new_count)
+      current = {
+        old_start = old_start,
+        old_count = old_count,
+        new_start = new_start,
+        new_count = new_count,
+        changed_lines = {},
+        old_changed_lines = {},
+        deletion_anchors = {},
+        body = {},
+      }
+      old_line = old_start
+      new_line = new_start
+    elseif current then
+      local prefix = line:sub(1, 1)
+      if prefix == " " then
+        current.body[#current.body + 1] = line
+        old_line = old_line + 1
+        new_line = new_line + 1
+      elseif prefix == "-" then
+        current.body[#current.body + 1] = line
+        current.old_changed_lines[#current.old_changed_lines + 1] = old_line
+        current.deletion_anchors[#current.deletion_anchors + 1] = math.max(1, new_line)
+        old_line = old_line + 1
+      elseif prefix == "+" then
+        current.body[#current.body + 1] = line
+        current.changed_lines[#current.changed_lines + 1] = new_line
+        new_line = new_line + 1
+      elseif prefix == "\\" then
+        current.body[#current.body + 1] = line
+      end
+    end
+  end
+  finish_hunk(hunks, current)
+
+  local occurrences = {}
+  for _, hunk in ipairs(hunks) do
+    local content_hash = vim.fn.sha256(table.concat(hunk.body, "\n"))
+    occurrences[content_hash] = (occurrences[content_hash] or 0) + 1
+    hunk.fingerprint = ("%s:%d"):format(content_hash, occurrences[content_hash])
+    hunk.body = nil
+    hunk.anchor = hunk.changed_lines[1] or hunk.deletion_anchors[1] or math.max(1, hunk.new_start)
+    hunk.old_anchor = hunk.old_changed_lines[1] or math.max(1, hunk.old_start)
+  end
+  return hunks
 end
 
 ---@param root string
@@ -165,7 +254,9 @@ function M.changes(root, merge_base)
     end
     change.patch = patch
     change.binary = binary_patch(patch)
-    change.line = first_changed_line(patch)
+    change.hunks = change.binary and {} or M.parse_hunks(patch)
+    change.line = change.status == "D" and (change.hunks[1] and change.hunks[1].old_anchor or 1)
+      or (change.hunks[1] and change.hunks[1].anchor or 1)
     change.fingerprint = vim.fn.sha256(
       table.concat({ change.raw_status, change.old_file or "", change.file, patch }, "\0")
     )
@@ -187,6 +278,7 @@ function M.changes(root, merge_base)
         raw_status = "??",
         patch = patch,
         binary = binary,
+        hunks = binary and {} or M.parse_hunks(patch),
         line = 1,
         fingerprint = vim.fn.sha256(table.concat({ "??", file, contents }, "\0")),
       }

@@ -22,7 +22,25 @@ end, {
 vim.api.nvim_create_user_command("AgenticFlowToggleReviewed", function()
   require("agentic-flow").toggle_reviewed()
 end, {
-  desc = "Toggle reviewed state for the current file",
+  desc = "Toggle reviewed state for every chunk in the current file",
+})
+
+vim.api.nvim_create_user_command("AgenticFlowToggleChunkReviewed", function()
+  require("agentic-flow").toggle_chunk_reviewed()
+end, {
+  desc = "Toggle reviewed state for the chunk under the cursor",
+})
+
+vim.api.nvim_create_user_command("AgenticFlowNextUnreviewed", function()
+  require("agentic-flow").next_unreviewed()
+end, {
+  desc = "Open the next unreviewed chunk",
+})
+
+vim.api.nvim_create_user_command("AgenticFlowPrevUnreviewed", function()
+  require("agentic-flow").prev_unreviewed()
+end, {
+  desc = "Open the previous unreviewed chunk",
 })
 
 vim.api.nvim_create_user_command("AgenticFlowComment", function(command)

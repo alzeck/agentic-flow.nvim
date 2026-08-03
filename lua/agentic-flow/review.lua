@@ -33,11 +33,33 @@ end
 local function entry(session, file)
   session.files[file] = session.files[file] or { comments = {} }
   session.files[file].comments = session.files[file].comments or {}
+  session.files[file].reviewed_hunks = type(session.files[file].reviewed_hunks) == "table"
+      and session.files[file].reviewed_hunks
+    or {}
   return session.files[file]
 end
 
+local function hunk_lookup(change)
+  local lookup = {}
+  for _, hunk in ipairs(change.hunks or {}) do
+    lookup[hunk.fingerprint] = true
+  end
+  return lookup
+end
+
+local function reviewed_hunk_count(file_entry, change)
+  local reviewed = 0
+  local stored = file_entry and file_entry.reviewed_hunks or {}
+  for _, hunk in ipairs(change.hunks or {}) do
+    if stored[hunk.fingerprint] then
+      reviewed = reviewed + 1
+    end
+  end
+  return reviewed
+end
+
 local function sync_session(context)
-  local changed = false
+  local changed = context.session._migrated_from ~= nil
   local active = {}
   for _, change in ipairs(context.changes) do
     active[change.file] = true
@@ -55,17 +77,83 @@ local function sync_session(context)
     end
 
     local file_entry = context.session.files[change.file]
-    if file_entry and file_entry.reviewed and file_entry.fingerprint ~= change.fingerprint then
-      file_entry.reviewed = false
-      file_entry.invalidated = true
-      changed = true
+    if file_entry then
+      file_entry.comments = file_entry.comments or {}
+      if #(change.hunks or {}) > 0 then
+        if type(file_entry.reviewed_hunks) ~= "table" then
+          file_entry.reviewed_hunks = {}
+          if file_entry.reviewed and file_entry.fingerprint == change.fingerprint then
+            for _, hunk in ipairs(change.hunks) do
+              file_entry.reviewed_hunks[hunk.fingerprint] = true
+            end
+          end
+          changed = true
+        end
+
+        local current_hunks = hunk_lookup(change)
+        local removed_reviewed_hunk = false
+        for fingerprint in pairs(file_entry.reviewed_hunks) do
+          if not current_hunks[fingerprint] then
+            file_entry.reviewed_hunks[fingerprint] = nil
+            removed_reviewed_hunk = true
+            changed = true
+          end
+        end
+
+        local was_reviewed = file_entry.reviewed == true
+        local reviewed = reviewed_hunk_count(file_entry, change)
+        local all_reviewed = reviewed == #change.hunks
+        if
+          reviewed == 0
+          and (removed_reviewed_hunk or (was_reviewed and file_entry.fingerprint ~= change.fingerprint))
+          and not all_reviewed
+          and not file_entry.invalidated
+        then
+          file_entry.invalidated = true
+          changed = true
+        end
+        if file_entry.reviewed ~= all_reviewed then
+          file_entry.reviewed = all_reviewed
+          changed = true
+        end
+        if all_reviewed then
+          if file_entry.fingerprint ~= change.fingerprint then
+            file_entry.fingerprint = change.fingerprint
+            changed = true
+          end
+          if file_entry.invalidated then
+            file_entry.invalidated = false
+            changed = true
+          end
+        end
+      else
+        local had_reviewed_hunks = type(file_entry.reviewed_hunks) == "table"
+          and next(file_entry.reviewed_hunks) ~= nil
+        if had_reviewed_hunks then
+          file_entry.reviewed_hunks = {}
+          changed = true
+        end
+        if
+          had_reviewed_hunks
+          or (file_entry.reviewed and file_entry.fingerprint ~= change.fingerprint)
+        then
+          file_entry.reviewed = false
+          file_entry.invalidated = true
+          changed = true
+        end
+      end
     end
   end
   for file, file_entry in pairs(context.session.files) do
-    if not active[file] and file_entry.reviewed then
-      file_entry.reviewed = false
-      file_entry.invalidated = true
-      changed = true
+    if not active[file] then
+      local had_reviewed_hunks = type(file_entry.reviewed_hunks) == "table"
+        and next(file_entry.reviewed_hunks) ~= nil
+      if file_entry.reviewed or had_reviewed_hunks then
+        file_entry.reviewed = false
+        file_entry.reviewed_hunks = {}
+        file_entry.invalidated = true
+        changed = true
+      end
     end
   end
   if changed then
@@ -152,16 +240,54 @@ end
 
 ---@param context table
 ---@param file string
----@return string, number
+---@return string, number, number, number
 function M.file_status(context, file)
+  local change = context.by_file[file]
   local file_entry = context.session.files[file]
+  local comments = file_entry and #(file_entry.comments or {}) or 0
+  if change and #(change.hunks or {}) > 0 then
+    local reviewed = reviewed_hunk_count(file_entry, change)
+    local total = #change.hunks
+    if reviewed == total then
+      return "reviewed", comments, reviewed, total
+    end
+    if reviewed > 0 then
+      return "partial", comments, reviewed, total
+    end
+    if file_entry and file_entry.invalidated then
+      return "invalidated", comments, reviewed, total
+    end
+    return "pending", comments, reviewed, total
+  end
   if file_entry and file_entry.reviewed then
-    return "reviewed", #(file_entry.comments or {})
+    return "reviewed", comments, 0, 0
   end
   if file_entry and file_entry.invalidated then
-    return "invalidated", #(file_entry.comments or {})
+    return "invalidated", comments, 0, 0
   end
-  return "pending", file_entry and #(file_entry.comments or {}) or 0
+  return "pending", comments, 0, 0
+end
+
+---@param context table
+---@param file string
+---@return number, number
+function M.hunk_progress(context, file)
+  local change = context.by_file[file]
+  if not change then
+    return 0, 0
+  end
+  return reviewed_hunk_count(context.session.files[file], change), #(change.hunks or {})
+end
+
+---@param context table
+---@param file string
+---@param hunk table
+---@return boolean
+function M.hunk_reviewed(context, file, hunk)
+  local file_entry = context.session.files[file]
+  return file_entry ~= nil
+    and type(file_entry.reviewed_hunks) == "table"
+    and file_entry.reviewed_hunks[hunk.fingerprint] == true
 end
 
 ---@param context table
@@ -228,19 +354,27 @@ function M.toggle_reviewed(config, opts)
   if not change then
     return nil, "the current file is not part of this review"
   end
+  file = assert(file)
 
   local file_entry = entry(context.session, file)
-  if not file_entry.reviewed and modified_buffer(context, file) then
+  local status = M.file_status(context, file)
+  if status ~= "reviewed" and modified_buffer(context, file) then
     return nil, "save the buffer before marking it reviewed"
   end
 
-  if file_entry.reviewed then
+  if status == "reviewed" then
     file_entry.reviewed = false
     file_entry.invalidated = false
+    file_entry.fingerprint = nil
+    file_entry.reviewed_hunks = {}
   else
     file_entry.reviewed = true
     file_entry.invalidated = false
     file_entry.fingerprint = change.fingerprint
+    file_entry.reviewed_hunks = {}
+    for _, hunk in ipairs(change.hunks or {}) do
+      file_entry.reviewed_hunks[hunk.fingerprint] = true
+    end
   end
   if not save(context) then
     return nil, "could not persist reviewed state"
@@ -249,6 +383,204 @@ function M.toggle_reviewed(config, opts)
     context = context,
     file = file,
     status = file_entry.reviewed and "reviewed" or "pending",
+  }
+end
+
+local function hunk_bounds(change, hunk)
+  if change.status == "D" then
+    return hunk.old_cursor_start, hunk.old_cursor_end
+  end
+  return hunk.new_cursor_start, hunk.new_cursor_end
+end
+
+local function hunk_anchor(change, hunk)
+  return change.status == "D" and hunk.old_anchor or hunk.anchor
+end
+
+---@param context table
+---@param file string
+---@param line number
+---@return table?
+function M.hunk_at_line(context, file, line)
+  local change = context.by_file[file]
+  if not change then
+    return nil
+  end
+  for _, hunk in ipairs(change.hunks or {}) do
+    local start_line, end_line = hunk_bounds(change, hunk)
+    if line >= start_line and line <= end_line then
+      return hunk
+    end
+  end
+end
+
+local function cursor_line(opts)
+  if opts.line then
+    return opts.line
+  end
+  local buf = opts.buf or vim.api.nvim_get_current_buf()
+  if vim.api.nvim_get_current_buf() == buf then
+    return vim.api.nvim_win_get_cursor(0)[1]
+  end
+  local windows = vim.fn.win_findbuf(buf)
+  return #windows > 0 and vim.api.nvim_win_get_cursor(windows[1])[1] or 1
+end
+
+local function update_file_review_state(context, file, change)
+  local file_entry = entry(context.session, file)
+  local reviewed = reviewed_hunk_count(file_entry, change)
+  file_entry.reviewed = #change.hunks > 0 and reviewed == #change.hunks
+  file_entry.invalidated = false
+  file_entry.fingerprint = file_entry.reviewed and change.fingerprint or nil
+  return reviewed
+end
+
+---@param config table
+---@param opts? table
+---@return table?, string?
+function M.toggle_chunk_reviewed(config, opts)
+  opts = opts or {}
+  local seed = opts.context
+  local context, err = M.resolve(config, {
+    root = seed and seed.root or opts.root,
+    base = seed and seed.base or opts.base,
+    buf = opts.buf,
+  })
+  if not context then
+    return nil, err
+  end
+
+  local file = current_file(context, opts)
+  local change = file and context.by_file[file] or nil
+  if not change then
+    return nil, "the current file is not part of this review"
+  end
+  file = assert(file)
+  if #(change.hunks or {}) == 0 then
+    return nil, "the current file has no textual review chunks"
+  end
+
+  local line = cursor_line(opts)
+  local hunk = M.hunk_at_line(context, file, line)
+  if not hunk then
+    return nil, "the cursor is not inside a review chunk"
+  end
+
+  local file_entry = entry(context.session, file)
+  local was_reviewed = file_entry.reviewed_hunks[hunk.fingerprint] == true
+  if not was_reviewed and modified_buffer(context, file) then
+    return nil, "save the buffer before marking this chunk reviewed"
+  end
+  if was_reviewed then
+    file_entry.reviewed_hunks[hunk.fingerprint] = nil
+  else
+    file_entry.reviewed_hunks[hunk.fingerprint] = true
+  end
+  local reviewed = update_file_review_state(context, file, change)
+  if not save(context) then
+    return nil, "could not persist chunk review state"
+  end
+  return {
+    context = context,
+    file = file,
+    hunk = hunk,
+    status = was_reviewed and "pending" or "reviewed",
+    reviewed = reviewed,
+    total = #change.hunks,
+  }
+end
+
+local function unreviewed_hunks(context)
+  local items = {}
+  for file_index, change in ipairs(context.changes) do
+    for _, hunk in ipairs(change.hunks or {}) do
+      if not M.hunk_reviewed(context, change.file, hunk) then
+        items[#items + 1] = {
+          file_index = file_index,
+          file = change.file,
+          change = change,
+          hunk = hunk,
+          line = hunk_anchor(change, hunk),
+        }
+      end
+    end
+  end
+  return items
+end
+
+local function current_file_index(context, file)
+  for index, change in ipairs(context.changes) do
+    if change.file == file then
+      return index
+    end
+  end
+end
+
+local function navigation_target(context, file, line, direction)
+  local items = unreviewed_hunks(context)
+  if #items == 0 then
+    return nil
+  end
+  local file_index = current_file_index(context, file)
+  if direction == "previous" then
+    for index = #items, 1, -1 do
+      local item = items[index]
+      if
+        not file_index
+        or item.file_index < file_index
+        or (item.file_index == file_index and item.line < line)
+      then
+        return item
+      end
+    end
+    return items[#items]
+  end
+  for _, item in ipairs(items) do
+    if
+      not file_index
+      or item.file_index > file_index
+      or (item.file_index == file_index and item.line > line)
+    then
+      return item
+    end
+  end
+  return items[1]
+end
+
+---@param config table
+---@param opts? table
+---@param direction "next"|"previous"
+---@return table?, string?
+function M.navigate_unreviewed(config, opts, direction)
+  opts = opts or {}
+  local seed = opts.context
+  local context = seed
+  if not context then
+    local err
+    context, err = M.resolve(config, {
+      root = opts.root,
+      base = opts.base,
+      buf = opts.buf,
+    })
+    if not context then
+      return nil, err
+    end
+  end
+
+  local file = current_file(context, opts)
+  local target = navigation_target(context, file, cursor_line(opts), direction)
+  if not target then
+    return nil, "there are no unreviewed textual chunks"
+  end
+  local buf, open_error = M.open_change(config, context, target.change, target.line)
+  if not buf then
+    return nil, open_error
+  end
+  return {
+    context = context,
+    file = target.file,
+    hunk = target.hunk,
+    buf = buf,
   }
 end
 

@@ -3,7 +3,7 @@ local util = require("agentic-flow.util")
 
 local M = {}
 
-local SCHEMA_VERSION = 1
+local SCHEMA_VERSION = 2
 local uv = vim.uv or vim.loop
 
 local function default_session(branch, base)
@@ -100,6 +100,10 @@ function M.load(root, branch, base)
       ("review state uses unsupported schema version %s"):format(tostring(session.version))
   end
 
+  if session.version < SCHEMA_VERSION then
+    session._migrated_from = session.version
+    session.version = SCHEMA_VERSION
+  end
   session.files = type(session.files) == "table" and session.files or {}
   session.next_comment_id = tonumber(session.next_comment_id) or 1
   return session
@@ -112,6 +116,8 @@ function M.save(root, session)
   if session._read_only then
     return false, "review state is read-only because its schema is newer than this plugin"
   end
+  session.version = SCHEMA_VERSION
+  session._migrated_from = nil
   local _, session_path, err = paths(root, session.branch, session.base)
   if not session_path then
     return false, err

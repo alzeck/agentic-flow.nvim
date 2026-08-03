@@ -34,9 +34,11 @@ Using `lazy.nvim`:
     signs = {
       comment = "●",
       stale = "!",
+      unreviewed = "▎",
     },
     display = {
       virtual_text = true,
+      unreviewed_chunks = true,
     },
   },
   keys = {
@@ -48,7 +50,22 @@ Using `lazy.nvim`:
     {
       "<leader>rr",
       "<cmd>AgenticFlowToggleReviewed<cr>",
-      desc = "Toggle file reviewed",
+      desc = "Toggle all file chunks reviewed",
+    },
+    {
+      "<leader>rh",
+      "<cmd>AgenticFlowToggleChunkReviewed<cr>",
+      desc = "Toggle chunk reviewed",
+    },
+    {
+      "]r",
+      "<cmd>AgenticFlowNextUnreviewed<cr>",
+      desc = "Next unreviewed chunk",
+    },
+    {
+      "[r",
+      "<cmd>AgenticFlowPrevUnreviewed<cr>",
+      desc = "Previous unreviewed chunk",
     },
     {
       "<leader>rc",
@@ -88,8 +105,10 @@ Using `lazy.nvim`:
 ```
 
 `picker`, `branch_picker`, and `comments_picker` are merged into their corresponding
-Snacks picker options. The `keys` entries are Lazy load triggers, so every mapping is
-available before the plugin loads and loads it only when used.
+Snacks picker options. The changed-files picker defaults to the Snacks `sidebar`
+layout; set `picker.layout` to another preset to override it. The `keys` entries are
+Lazy load triggers, so every mapping is available before the plugin loads and loads
+it only when used.
 
 ## Review workflow
 
@@ -103,9 +122,10 @@ The comparison starts at the merge-base with the selected base and ends at the
 working tree. It includes committed branch changes, staged changes, unstaged changes,
 and untracked files.
 
-The changes picker shows one row per file:
+The review opens as a persistent left sidebar with one row per changed file:
 
 - `○` needs review
+- `◐` partly reviewed
 - `✓` reviewed
 - `↻` changed since it was reviewed
 
@@ -119,13 +139,37 @@ Picker actions are available in the input and list windows:
 | List comments | `<C-l>` | `l` |
 | Copy comments | `<C-y>` | `y` |
 
-Press `<CR>` to open a changed file at its first changed line. Deleted files open
-their base contents in a read-only buffer. Binary files support file-level notes but
-not line selections.
+Press `<CR>` to open a changed file at its first changed line in the main editing
+window. The sidebar stays open so you can move through the rest of the review.
+Deleted files open their base contents in a read-only buffer. Binary files support
+file-level notes but not line selections.
 
-Files are fingerprinted when marked reviewed. Any later content, status, rename, or
-effective base-diff change moves the file back to review. A modified buffer must be
-saved before it can be marked reviewed.
+Textual changes are divided into Git diff chunks. Each unreviewed chunk has a subtle
+changed-line tint and a `▎` gutter marker. Partly reviewed sidebar rows show their
+reviewed/total chunk count.
+
+Toggle the chunk under the cursor:
+
+```vim
+:AgenticFlowToggleChunkReviewed
+```
+
+Move through every unreviewed chunk in the review. Navigation continues across files
+and wraps at either end:
+
+```vim
+:AgenticFlowNextUnreviewed
+:AgenticFlowPrevUnreviewed
+```
+
+Use `:AgenticFlowToggleReviewed` or sidebar `r` to mark every chunk in a file
+reviewed, or reset them all to pending. A modified buffer must be saved before a
+chunk can be reviewed.
+
+Chunk identities are content-based. If a reviewed file changes, unchanged chunks
+stay reviewed while edited or newly added chunks return to review. Binary,
+rename-only, and other changes without textual hunks retain file-level review state.
+Set `display.unreviewed_chunks = false` to disable editor highlighting.
 
 ## Comparison base
 
@@ -220,7 +264,10 @@ Mappings belong in the `keys` field of the `lazy.nvim` plugin spec, as shown in
 | Mapping | Action |
 | --- | --- |
 | `<leader>ro` | Open the changed-files review |
-| `<leader>rr` | Toggle reviewed |
+| `<leader>rr` | Toggle every chunk in the current file |
+| `<leader>rh` | Toggle the chunk under the cursor |
+| `]r` | Open the next unreviewed chunk |
+| `[r` | Open the previous unreviewed chunk |
 | `<leader>rc` | Comment the current line, or the selected lines in visual mode |
 | `<leader>rf` | Add a file-level comment |
 | `<leader>rl` | List comments |
@@ -249,6 +296,9 @@ local review = require("agentic-flow")
 review.changes({ base = "origin/develop" })
 review.select_base()
 review.toggle_reviewed()
+review.toggle_chunk_reviewed()
+review.next_unreviewed()
+review.prev_unreviewed()
 review.add_comment()
 review.comments()
 review.copy_comments({ register = "+" })

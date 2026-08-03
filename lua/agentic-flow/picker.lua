@@ -4,9 +4,11 @@ local state = require("agentic-flow.state")
 local util = require("agentic-flow.util")
 
 local M = {}
+local active_changes
 
 local review_icons = {
   pending = { "○", "AgenticFlowPending" },
+  partial = { "◐", "AgenticFlowPartial" },
   reviewed = { "✓", "AgenticFlowReviewed" },
   invalidated = { "↻", "AgenticFlowStale" },
 }
@@ -54,31 +56,95 @@ end
 
 local function change_format(item)
   local icon = review_icons[item.review_status] or review_icons.pending
-  local comment_count = item.comment_count > 0
-      and ("  %d note%s"):format(item.comment_count, item.comment_count == 1 and "" or "s")
-    or ""
+  local metadata = {}
+  if item.hunk_count > 0 then
+    metadata[#metadata + 1] = ("%d/%d %s"):format(
+      item.reviewed_hunks,
+      item.hunk_count,
+      item.hunk_count == 1 and "chunk" or "chunks"
+    )
+  end
+  if item.comment_count > 0 then
+    metadata[#metadata + 1] = ("%d note%s"):format(
+      item.comment_count,
+      item.comment_count == 1 and "" or "s"
+    )
+  end
+  local detail = #metadata > 0 and ("  " .. table.concat(metadata, " · ")) or ""
   local path = item.change.old_file and ("%s → %s"):format(item.change.old_file, item.change.file)
     or item.change.file
   return {
     { icon[1] .. " ", icon[2] },
     { item.change.status .. " ", status_highlights[item.change.status] or "Comment" },
     { path, "SnacksPickerFile" },
-    { comment_count, "Comment" },
+    { detail, item.review_status == "partial" and "AgenticFlowPartial" or "Comment" },
   }
 end
 
+local function update_change_item(item, context, change)
+  local status, comment_count, reviewed_hunks, hunk_count = review.file_status(context, change.file)
+  item.text = table.concat({
+    status,
+    change.status_label,
+    change.old_file or "",
+    change.file,
+  }, " ")
+  item.change = change
+  item.review_status = status
+  item.comment_count = comment_count
+  item.reviewed_hunks = reviewed_hunks
+  item.hunk_count = hunk_count
+  item.cwd = context.root
+  item.pos = { change.line or 1, 0 }
+  item.preview = {
+    text = change.patch ~= "" and change.patch
+      or ("%s: no textual diff available"):format(change.file),
+    ft = "diff",
+    loc = false,
+  }
+  return item
+end
+
 local function update_change_items(picker, context)
+  local existing = {}
   for _, item in ipairs(picker.opts.items or {}) do
-    item.review_status, item.comment_count = review.file_status(context, item.change.file)
+    existing[item.change.file] = item
   end
+  local items = {}
+  for _, change in ipairs(context.changes) do
+    items[#items + 1] = update_change_item(existing[change.file] or {}, context, change)
+  end
+  picker.opts.items = items
   local reviewed, total = review.progress(context)
   picker.title = ("Review vs %s  %d/%d"):format(context.base, reviewed, total)
   picker:refresh()
 end
 
-local function change_actions(config, context)
+---@param context table
+---@return boolean
+function M.refresh_changes(context)
+  local active = active_changes
+  if
+    not active
+    or active.picker.closed
+    or active.root ~= context.root
+    or active.branch ~= context.branch
+    or active.base ~= context.base
+  then
+    return false
+  end
+  active.context_ref.value = context
+  local ok = pcall(update_change_items, active.picker, context)
+  if not ok then
+    active_changes = nil
+  end
+  return ok
+end
+
+local function change_actions(config, context_ref)
   return {
     agentic_toggle_reviewed = function(picker, item)
+      local context = context_ref.value
       local result, err = review.toggle_reviewed(config, {
         context = context,
         file = item.change.file,
@@ -88,9 +154,12 @@ local function change_actions(config, context)
         return
       end
       context = result.context
+      context_ref.value = context
       update_change_items(picker, context)
+      refresh_review_buffers(config, context, item.change.file)
     end,
     agentic_comment = function(picker, item)
+      local context = context_ref.value
       picker:close()
       vim.schedule(function()
         require("agentic-flow").add_comment({
@@ -101,18 +170,21 @@ local function change_actions(config, context)
       end)
     end,
     agentic_base = function(picker)
+      local context = context_ref.value
       picker:close()
       vim.schedule(function()
         M.select_base(config, { context = context })
       end)
     end,
     agentic_comments = function(picker)
+      local context = context_ref.value
       picker:close()
       vim.schedule(function()
         M.comments(config, { context = context })
       end)
     end,
     agentic_copy = function()
+      local context = context_ref.value
       local _, err, count = review.copy_comments(config, { context = context })
       if err then
         notify_error(err)
@@ -169,28 +241,10 @@ function M.changes(config, opts)
 
   local items = {}
   for _, change in ipairs(context.changes) do
-    local status, comment_count = review.file_status(context, change.file)
-    items[#items + 1] = {
-      text = table.concat({
-        status,
-        change.status_label,
-        change.old_file or "",
-        change.file,
-      }, " "),
-      change = change,
-      review_status = status,
-      comment_count = comment_count,
-      cwd = context.root,
-      pos = { change.line or 1, 0 },
-      preview = {
-        text = change.patch ~= "" and change.patch
-          or ("%s: no textual diff available"):format(change.file),
-        ft = "diff",
-        loc = false,
-      },
-    }
+    items[#items + 1] = update_change_item({}, context, change)
   end
 
+  local context_ref = { value = context }
   local reviewed, total = review.progress(context)
   local picker_opts = vim.tbl_deep_extend(
     "force",
@@ -200,6 +254,10 @@ function M.changes(config, opts)
       items = items,
       format = change_format,
       preview = "preview",
+      focus = "list",
+      auto_close = false,
+      jump = { close = false },
+      layout = { preset = "sidebar", preview = false },
       matcher = { sort_empty = true, filename_bonus = true },
       sort = { fields = { "score:desc", "idx" } },
       show_empty = true,
@@ -208,19 +266,36 @@ function M.changes(config, opts)
     opts.picker or {},
     {
       confirm = function(picker, item)
-        picker:close()
+        if not item then
+          return
+        end
+        local main = picker.main
         vim.schedule(function()
-          local _, open_error = review.open_change(config, context, item.change)
+          local current_context = context_ref.value
+          if main and vim.api.nvim_win_is_valid(main) then
+            vim.api.nvim_set_current_win(main)
+          end
+          local _, open_error = review.open_change(config, current_context, item.change)
           if open_error then
             notify_error(open_error)
           end
         end)
       end,
-      actions = change_actions(config, context),
+      actions = change_actions(config, context_ref),
       win = change_keys(),
     }
   )
-  return dependency.picker.pick(picker_opts)
+  local picker = dependency.picker.pick(picker_opts)
+  if picker then
+    active_changes = {
+      picker = picker,
+      context_ref = context_ref,
+      root = context.root,
+      branch = context.branch,
+      base = context.base,
+    }
+  end
+  return picker
 end
 
 local function branch_format(item)
