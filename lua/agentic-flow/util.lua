@@ -2,6 +2,8 @@ local M = {}
 
 local uv = vim.uv or vim.loop
 
+---@param message string
+---@param level? integer one of vim.log.levels
 function M.notify(message, level)
   vim.notify(message, level or vim.log.levels.INFO, { title = "agentic-flow.nvim" })
 end
@@ -92,12 +94,47 @@ function M.absolute(root, path)
   return vim.fs.normalize(root .. "/" .. path)
 end
 
+---@param path string
+---@return string
+local function resolved(path)
+  path = vim.fs.normalize(path)
+  local real = uv.fs_realpath(path)
+  if real then
+    return vim.fs.normalize(real)
+  end
+  local parent = vim.fs.dirname(path)
+  local resolved_parent = parent and uv.fs_realpath(parent) or nil
+  if resolved_parent then
+    return vim.fs.normalize(resolved_parent .. "/" .. vim.fs.basename(path))
+  end
+  return path
+end
+
+-- **Tree order** as a plain string key: every segment carries a marker that
+-- sorts directories (`!`, 0x21) ahead of files (`#`, 0x23) before its name is
+-- ever compared, and each segment is built onto its parent's, so a directory's
+-- whole subtree stays contiguous beneath it. Comparing keys byte for byte is
+-- the entire rule, which is what lets the sidebar, unreviewed-hunk navigation
+-- and comment export share one order without sharing any code.
+---@param path string
+---@param directory? boolean the final segment names a directory, not a file
+---@return string
+function M.tree_key(path, directory)
+  local parts = vim.split(path, "/", { plain = true })
+  local key = {}
+  for index, part in ipairs(parts) do
+    local marker = (index < #parts or directory) and "!" or "#"
+    key[#key + 1] = marker .. part .. " "
+  end
+  return table.concat(key)
+end
+
 ---@param root string
 ---@param path string
 ---@return string?
 function M.relative(root, path)
-  path = vim.fs.normalize(path)
-  root = vim.fs.normalize(root)
+  path = resolved(path)
+  root = resolved(root)
   if path == root then
     return "."
   end

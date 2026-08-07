@@ -1,35 +1,27 @@
-local git = require("agentic-flow.git")
+--- Pure review domain. Every function operates on an explicit context
+--- (built by the pipeline) plus explicit inputs — no window, buffer, or git
+--- calls — so the whole layer is headless-testable.
+---
+--- A context is `{ root, branch, base, merge_base, storage_dir, changes,
+--- by_file, session }`.
 local state = require("agentic-flow.state")
 local util = require("agentic-flow.util")
 
 local M = {}
 
-local active_context
-
+---@param context AgenticFlow.Context
+---@return boolean
 local function save(context)
-  local ok, err = state.save(context.root, context.session)
+  local ok, err = state.save(context.storage_dir, context.session)
   if not ok then
     util.notify("Could not save review state: " .. (err or "unknown error"), vim.log.levels.ERROR)
   end
   return ok
 end
 
-local function candidate_cwd(opts)
-  if opts and opts.root then
-    return opts.root
-  end
-  local buf = opts and opts.buf or vim.api.nvim_get_current_buf()
-  local stored_root = vim.b[buf].agentic_flow_root
-  if type(stored_root) == "string" and stored_root ~= "" then
-    return stored_root
-  end
-  local name = vim.api.nvim_buf_get_name(buf)
-  if name ~= "" and not name:match("^agentic%-flow://") then
-    return vim.fs.dirname(name)
-  end
-  return vim.fn.getcwd()
-end
-
+---@param session AgenticFlow.Session
+---@param file string
+---@return AgenticFlow.FileEntry
 local function entry(session, file)
   session.files[file] = session.files[file] or { comments = {} }
   session.files[file].comments = session.files[file].comments or {}
@@ -39,6 +31,8 @@ local function entry(session, file)
   return session.files[file]
 end
 
+---@param change AgenticFlow.Change
+---@return table<string, true>
 local function hunk_lookup(change)
   local lookup = {}
   for _, hunk in ipairs(change.hunks or {}) do
@@ -47,6 +41,9 @@ local function hunk_lookup(change)
   return lookup
 end
 
+---@param file_entry AgenticFlow.FileEntry?
+---@param change AgenticFlow.Change
+---@return integer
 local function reviewed_hunk_count(file_entry, change)
   local reviewed = 0
   local stored = file_entry and file_entry.reviewed_hunks or {}
@@ -58,8 +55,103 @@ local function reviewed_hunk_count(file_entry, change)
   return reviewed
 end
 
-local function sync_session(context)
-  local changed = context.session._migrated_from ~= nil
+---Reconcile one file's stored entry with its fresh change.
+---
+---File states (see CONTEXT.md): **pending** — no reviewed hunks and nothing
+---was lost; **partial** — some hunks reviewed; **reviewed** — every hunk
+---reviewed (or the file-level flag for non-textual changes); **invalidated**
+---— previously reviewed work no longer applies: every reviewed hunk
+---disappeared from the diff, a file-level fingerprint moved on, or the file
+---left the diff entirely (handled by the caller).
+---
+---Because this only ever runs for a file that *is* in the diff, it is also
+---where an **off-diff comment** loses that status: from here on the ground
+---can move under it, so leaving the diff again would orphan it.
+---@param file_entry AgenticFlow.FileEntry
+---@param change AgenticFlow.Change
+---@return boolean changed
+local function sync_file(file_entry, change)
+  local changed = false
+  file_entry.comments = file_entry.comments or {}
+  if type(file_entry.reviewed_hunks) ~= "table" then
+    file_entry.reviewed_hunks = {}
+    changed = true
+  end
+  for _, comment in ipairs(file_entry.comments) do
+    if comment.off_diff then
+      comment.off_diff = false
+      changed = true
+    end
+  end
+
+  if #(change.hunks or {}) > 0 then
+    local current_hunks = hunk_lookup(change)
+    local removed_reviewed_hunk = false
+    for fingerprint in pairs(file_entry.reviewed_hunks) do
+      if not current_hunks[fingerprint] then
+        file_entry.reviewed_hunks[fingerprint] = nil
+        removed_reviewed_hunk = true
+        changed = true
+      end
+    end
+
+    local was_reviewed = file_entry.reviewed == true
+    local reviewed = reviewed_hunk_count(file_entry, change)
+    local all_reviewed = reviewed == #change.hunks
+    if
+      reviewed == 0
+      and (removed_reviewed_hunk or (was_reviewed and file_entry.fingerprint ~= change.fingerprint))
+      and not all_reviewed
+      and not file_entry.invalidated
+    then
+      file_entry.invalidated = true
+      changed = true
+    end
+    if file_entry.reviewed ~= all_reviewed then
+      file_entry.reviewed = all_reviewed
+      changed = true
+    end
+    if all_reviewed then
+      if file_entry.fingerprint ~= change.fingerprint then
+        file_entry.fingerprint = change.fingerprint
+        changed = true
+      end
+      if file_entry.invalidated then
+        file_entry.invalidated = false
+        changed = true
+      end
+    end
+  else
+    -- Non-textual change (binary, pure rename): only file-level review
+    -- exists; a content change invalidates it.
+    local had_reviewed_hunks = next(file_entry.reviewed_hunks) ~= nil
+    if had_reviewed_hunks then
+      file_entry.reviewed_hunks = {}
+      changed = true
+    end
+    if
+      had_reviewed_hunks
+      or (file_entry.reviewed and file_entry.fingerprint ~= change.fingerprint)
+    then
+      file_entry.reviewed = false
+      file_entry.invalidated = true
+      changed = true
+    end
+  end
+  return changed
+end
+
+---Reconcile the whole session with the fresh change listing: follow renames,
+---run the per-file transition, and invalidate entries whose file left the
+---diff. Persists when anything moved.
+---
+---An entry holding only **off-diff comments** carries no review state, so
+---the departed-file pass below never touches it — a deliberate note is not
+---retroactively turned into an **orphan comment**.
+---@param context AgenticFlow.Context
+---@return boolean changed
+function M.sync_session(context)
+  local changed = false
   local active = {}
   for _, change in ipairs(context.changes) do
     active[change.file] = true
@@ -78,72 +170,10 @@ local function sync_session(context)
 
     local file_entry = context.session.files[change.file]
     if file_entry then
-      file_entry.comments = file_entry.comments or {}
-      if #(change.hunks or {}) > 0 then
-        if type(file_entry.reviewed_hunks) ~= "table" then
-          file_entry.reviewed_hunks = {}
-          if file_entry.reviewed and file_entry.fingerprint == change.fingerprint then
-            for _, hunk in ipairs(change.hunks) do
-              file_entry.reviewed_hunks[hunk.fingerprint] = true
-            end
-          end
-          changed = true
-        end
-
-        local current_hunks = hunk_lookup(change)
-        local removed_reviewed_hunk = false
-        for fingerprint in pairs(file_entry.reviewed_hunks) do
-          if not current_hunks[fingerprint] then
-            file_entry.reviewed_hunks[fingerprint] = nil
-            removed_reviewed_hunk = true
-            changed = true
-          end
-        end
-
-        local was_reviewed = file_entry.reviewed == true
-        local reviewed = reviewed_hunk_count(file_entry, change)
-        local all_reviewed = reviewed == #change.hunks
-        if
-          reviewed == 0
-          and (removed_reviewed_hunk or (was_reviewed and file_entry.fingerprint ~= change.fingerprint))
-          and not all_reviewed
-          and not file_entry.invalidated
-        then
-          file_entry.invalidated = true
-          changed = true
-        end
-        if file_entry.reviewed ~= all_reviewed then
-          file_entry.reviewed = all_reviewed
-          changed = true
-        end
-        if all_reviewed then
-          if file_entry.fingerprint ~= change.fingerprint then
-            file_entry.fingerprint = change.fingerprint
-            changed = true
-          end
-          if file_entry.invalidated then
-            file_entry.invalidated = false
-            changed = true
-          end
-        end
-      else
-        local had_reviewed_hunks = type(file_entry.reviewed_hunks) == "table"
-          and next(file_entry.reviewed_hunks) ~= nil
-        if had_reviewed_hunks then
-          file_entry.reviewed_hunks = {}
-          changed = true
-        end
-        if
-          had_reviewed_hunks
-          or (file_entry.reviewed and file_entry.fingerprint ~= change.fingerprint)
-        then
-          file_entry.reviewed = false
-          file_entry.invalidated = true
-          changed = true
-        end
-      end
+      changed = sync_file(file_entry, change) or changed
     end
   end
+
   for file, file_entry in pairs(context.session.files) do
     if not active[file] then
       local had_reviewed_hunks = type(file_entry.reviewed_hunks) == "table"
@@ -156,91 +186,16 @@ local function sync_session(context)
       end
     end
   end
+
   if changed then
     save(context)
   end
+  return changed
 end
 
----@param config table
----@param opts? table
----@return table?, string?
-function M.resolve(config, opts)
-  opts = opts or {}
-  local root, root_error = git.root(candidate_cwd(opts))
-  if not root then
-    return nil, root_error or "not inside a Git repository"
-  end
-
-  local branch = git.branch(root)
-  local base = opts.base or state.remembered_base(root, branch) or config.base
-  local valid, ref_error = git.validate_ref(root, base)
-  if not valid then
-    return nil, ("invalid comparison base %q: %s"):format(base, ref_error or "not found")
-  end
-
-  local merge_base, merge_error = git.merge_base(root, base)
-  if not merge_base then
-    return nil,
-      ("could not find a merge-base with %q: %s"):format(base, merge_error or "unknown error")
-  end
-
-  local changes, changes_error = git.changes(root, merge_base)
-  if not changes then
-    return nil, changes_error
-  end
-
-  local session, session_error = state.load(root, branch, base)
-  local context = {
-    root = root,
-    branch = branch,
-    base = base,
-    merge_base = merge_base,
-    changes = changes,
-    by_file = {},
-    session = session,
-  }
-  for _, change in ipairs(changes) do
-    context.by_file[change.file] = change
-  end
-
-  sync_session(context)
-  for file, file_entry in pairs(context.session.files) do
-    if #(file_entry.comments or {}) > 0 then
-      local contents
-      local absolute = util.absolute(root, file)
-      if vim.uv.fs_stat(absolute) then
-        contents = util.read_file(absolute)
-      elseif context.by_file[file] and context.by_file[file].status == "D" then
-        contents = git.file_at(root, merge_base, context.by_file[file].old_file or file)
-      end
-      if contents and not contents:find("\0", 1, true) then
-        M.relocate_comments(context, file, util.split_lines(contents))
-      end
-    end
-  end
-  if opts.remember_base then
-    local remembered, remember_error = state.remember_base(root, branch, base)
-    if not remembered then
-      util.notify(
-        "Could not remember comparison base: " .. (remember_error or "unknown error"),
-        vim.log.levels.WARN
-      )
-    end
-  end
-  if session_error then
-    util.notify(session_error, vim.log.levels.WARN)
-  end
-  active_context = context
-  return context
-end
-
-function M.active()
-  return active_context
-end
-
----@param context table
+---@param context AgenticFlow.Context
 ---@param file string
----@return string, number, number, number
+---@return "reviewed"|"partial"|"invalidated"|"pending" status, integer comments, integer reviewed, integer total
 function M.file_status(context, file)
   local change = context.by_file[file]
   local file_entry = context.session.files[file]
@@ -268,9 +223,63 @@ function M.file_status(context, file)
   return "pending", comments, 0, 0
 end
 
----@param context table
+---Every file of the review beneath `directory`, at any depth. Paths are not
+---compacted, so a directory node names one path component and the prefix walk
+---below is what makes marking reach the whole subtree.
+---@param context AgenticFlow.Context
+---@param directory string
+---@return string[]
+function M.directory_files(context, directory)
+  local prefix = directory .. "/"
+  local files = {}
+  for _, change in ipairs(context.changes) do
+    if vim.startswith(change.file, prefix) then
+      files[#files + 1] = change.file
+    end
+  end
+  return files
+end
+
+---A directory's **derived status**: computed from its descendants on every
+---call and never stored. Nothing being stored is what preserves **Freshness** —
+---a file that appears inside an already-marked directory arrives pending
+---instead of being swallowed by a directory-level flag.
+---
+---`invalidated` outranks every other state and, because every ancestor derives
+---from the same descendants, it propagates to the root. The counts come back
+---alongside it: the glyph carries the alarm, the badge carries the progress.
+---@param context AgenticFlow.Context
+---@param directory string
+---@return "reviewed"|"partial"|"invalidated"|"pending" status, integer reviewed, integer total
+function M.directory_status(context, directory)
+  local files = M.directory_files(context, directory)
+  local reviewed, invalidated, started = 0, false, false
+  for _, file in ipairs(files) do
+    local status = M.file_status(context, file)
+    if status == "reviewed" then
+      reviewed = reviewed + 1
+      started = true
+    elseif status == "invalidated" then
+      invalidated = true
+    elseif status == "partial" then
+      started = true
+    end
+  end
+  if invalidated then
+    return "invalidated", reviewed, #files
+  end
+  if #files > 0 and reviewed == #files then
+    return "reviewed", reviewed, #files
+  end
+  if started then
+    return "partial", reviewed, #files
+  end
+  return "pending", reviewed, #files
+end
+
+---@param context AgenticFlow.Context
 ---@param file string
----@return number, number
+---@return integer reviewed, integer total
 function M.hunk_progress(context, file)
   local change = context.by_file[file]
   if not change then
@@ -279,19 +288,19 @@ function M.hunk_progress(context, file)
   return reviewed_hunk_count(context.session.files[file], change), #(change.hunks or {})
 end
 
----@param context table
+---@param context AgenticFlow.Context
 ---@param file string
----@param hunk table
+---@param hunk AgenticFlow.Hunk
 ---@return boolean
 function M.hunk_reviewed(context, file, hunk)
   local file_entry = context.session.files[file]
   return file_entry ~= nil
     and type(file_entry.reviewed_hunks) == "table"
-    and file_entry.reviewed_hunks[hunk.fingerprint] == true
+    and file_entry.reviewed_hunks[hunk.fingerprint] ~= nil
 end
 
----@param context table
----@return number, number
+---@param context AgenticFlow.Context
+---@return integer reviewed, integer total
 function M.progress(context)
   local reviewed = 0
   for _, change in ipairs(context.changes) do
@@ -302,90 +311,9 @@ function M.progress(context)
   return reviewed, #context.changes
 end
 
-local function current_file(context, opts)
-  if opts.file then
-    return opts.file
-  end
-  local buf = opts.buf or vim.api.nvim_get_current_buf()
-  local stored = vim.b[buf].agentic_flow_path
-  if type(stored) == "string" and stored ~= "" then
-    return stored
-  end
-  local name = vim.api.nvim_buf_get_name(buf)
-  return name ~= "" and util.relative(context.root, name) or nil
-end
-
-local function modified_buffer(context, file)
-  local absolute = util.absolute(context.root, file)
-  local buf = vim.fn.bufnr(absolute)
-  if buf > 0 and vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].modified then
-    return true
-  end
-  for _, candidate in ipairs(vim.api.nvim_list_bufs()) do
-    if
-      vim.api.nvim_buf_is_valid(candidate)
-      and vim.b[candidate].agentic_flow_root == context.root
-      and vim.b[candidate].agentic_flow_path == file
-      and vim.bo[candidate].modified
-    then
-      return true
-    end
-  end
-  return false
-end
-
----@param config table
----@param opts? table
----@return table?, string?
-function M.toggle_reviewed(config, opts)
-  opts = opts or {}
-  local seed = opts.context
-  local context, err = M.resolve(config, {
-    root = seed and seed.root or opts.root,
-    base = seed and seed.base or opts.base,
-    buf = opts.buf,
-  })
-  if not context then
-    return nil, err
-  end
-
-  local file = current_file(context, opts)
-  local change = file and context.by_file[file] or nil
-  if not change then
-    return nil, "the current file is not part of this review"
-  end
-  file = assert(file)
-
-  local file_entry = entry(context.session, file)
-  local status = M.file_status(context, file)
-  if status ~= "reviewed" and modified_buffer(context, file) then
-    return nil, "save the buffer before marking it reviewed"
-  end
-
-  if status == "reviewed" then
-    file_entry.reviewed = false
-    file_entry.invalidated = false
-    file_entry.fingerprint = nil
-    file_entry.reviewed_hunks = {}
-  else
-    file_entry.reviewed = true
-    file_entry.invalidated = false
-    file_entry.fingerprint = change.fingerprint
-    file_entry.reviewed_hunks = {}
-    for _, hunk in ipairs(change.hunks or {}) do
-      file_entry.reviewed_hunks[hunk.fingerprint] = true
-    end
-  end
-  if not save(context) then
-    return nil, "could not persist reviewed state"
-  end
-  return {
-    context = context,
-    file = file,
-    status = file_entry.reviewed and "reviewed" or "pending",
-  }
-end
-
+---@param change AgenticFlow.Change
+---@param hunk AgenticFlow.Hunk
+---@return integer start_line, integer end_line
 local function hunk_bounds(change, hunk)
   if change.status == "D" then
     return hunk.old_cursor_start, hunk.old_cursor_end
@@ -393,14 +321,19 @@ local function hunk_bounds(change, hunk)
   return hunk.new_cursor_start, hunk.new_cursor_end
 end
 
+---@param change AgenticFlow.Change
+---@param hunk AgenticFlow.Hunk
+---@return integer
 local function hunk_anchor(change, hunk)
   return change.status == "D" and hunk.old_anchor or hunk.anchor
 end
 
----@param context table
+---Resolve the hunk containing `line` on the current side (old side for
+---deleted files, whose buffers show the merge-base contents).
+---@param context AgenticFlow.Context
 ---@param file string
----@param line number
----@return table?
+---@param line integer
+---@return AgenticFlow.Hunk?
 function M.hunk_at_line(context, file, line)
   local change = context.by_file[file]
   if not change then
@@ -414,18 +347,28 @@ function M.hunk_at_line(context, file, line)
   end
 end
 
-local function cursor_line(opts)
-  if opts.line then
-    return opts.line
+---Resolve the hunk containing an old-side `line` — the diff view's before
+---side maps its cursor through this.
+---@param context AgenticFlow.Context
+---@param file string
+---@param line integer
+---@return AgenticFlow.Hunk?
+function M.hunk_at_old_line(context, file, line)
+  local change = context.by_file[file]
+  if not change then
+    return nil
   end
-  local buf = opts.buf or vim.api.nvim_get_current_buf()
-  if vim.api.nvim_get_current_buf() == buf then
-    return vim.api.nvim_win_get_cursor(0)[1]
+  for _, hunk in ipairs(change.hunks or {}) do
+    if line >= hunk.old_cursor_start and line <= hunk.old_cursor_end then
+      return hunk
+    end
   end
-  local windows = vim.fn.win_findbuf(buf)
-  return #windows > 0 and vim.api.nvim_win_get_cursor(windows[1])[1] or 1
 end
 
+---@param context AgenticFlow.Context
+---@param file string
+---@param change AgenticFlow.Change
+---@return integer reviewed
 local function update_file_review_state(context, file, change)
   local file_entry = entry(context.session, file)
   local reviewed = reviewed_hunk_count(file_entry, change)
@@ -435,53 +378,43 @@ local function update_file_review_state(context, file, change)
   return reviewed
 end
 
----@param config table
----@param opts? table
----@return table?, string?
-function M.toggle_chunk_reviewed(config, opts)
-  opts = opts or {}
-  local seed = opts.context
-  local context, err = M.resolve(config, {
-    root = seed and seed.root or opts.root,
-    base = seed and seed.base or opts.base,
-    buf = opts.buf,
-  })
-  if not context then
-    return nil, err
-  end
-
-  local file = current_file(context, opts)
-  local change = file and context.by_file[file] or nil
+---Toggle one hunk, keyed by fingerprint. Records `reviewed_at` on review.
+---@param context AgenticFlow.Context
+---@param file string
+---@param fingerprint string
+---@return { file: string, hunk: AgenticFlow.Hunk, status: "reviewed"|"pending", reviewed: integer, total: integer }?, string?
+function M.toggle_hunk(context, file, fingerprint)
+  local change = context.by_file[file]
   if not change then
-    return nil, "the current file is not part of this review"
+    return nil, "the file is not part of this review"
   end
-  file = assert(file)
   if #(change.hunks or {}) == 0 then
-    return nil, "the current file has no textual review chunks"
+    return nil, "the file has no textual review hunks"
   end
 
-  local line = cursor_line(opts)
-  local hunk = M.hunk_at_line(context, file, line)
+  local hunk
+  for _, candidate in ipairs(change.hunks) do
+    if candidate.fingerprint == fingerprint then
+      hunk = candidate
+      break
+    end
+  end
   if not hunk then
-    return nil, "the cursor is not inside a review chunk"
+    return nil, "this hunk is no longer part of this review (stale fingerprint)"
   end
 
   local file_entry = entry(context.session, file)
-  local was_reviewed = file_entry.reviewed_hunks[hunk.fingerprint] == true
-  if not was_reviewed and modified_buffer(context, file) then
-    return nil, "save the buffer before marking this chunk reviewed"
-  end
+  local was_reviewed = file_entry.reviewed_hunks[fingerprint] ~= nil
   if was_reviewed then
-    file_entry.reviewed_hunks[hunk.fingerprint] = nil
+    file_entry.reviewed_hunks[fingerprint] = nil
   else
-    file_entry.reviewed_hunks[hunk.fingerprint] = true
+    file_entry.reviewed_hunks[fingerprint] = { reviewed_at = os.time() }
   end
   local reviewed = update_file_review_state(context, file, change)
   if not save(context) then
-    return nil, "could not persist chunk review state"
+    return nil, "could not persist hunk review state"
   end
   return {
-    context = context,
     file = file,
     hunk = hunk,
     status = was_reviewed and "pending" or "reviewed",
@@ -490,6 +423,79 @@ function M.toggle_chunk_reviewed(config, opts)
   }
 end
 
+---Drive one file to a whole-file reviewed state without persisting: review
+---every hunk (or the file-level flag for non-textual changes), or reset
+---everything back to pending. Callers own the `save`, so a fan-out across a
+---directory costs one write rather than one per file.
+---@param context AgenticFlow.Context
+---@param file string
+---@param change AgenticFlow.Change
+---@param reviewed boolean
+local function set_file_reviewed(context, file, change, reviewed)
+  local file_entry = entry(context.session, file)
+  file_entry.invalidated = false
+  file_entry.reviewed_hunks = {}
+  file_entry.reviewed = reviewed
+  file_entry.fingerprint = reviewed and change.fingerprint or nil
+  if reviewed then
+    local reviewed_at = os.time()
+    for _, hunk in ipairs(change.hunks or {}) do
+      file_entry.reviewed_hunks[hunk.fingerprint] = { reviewed_at = reviewed_at }
+    end
+  end
+end
+
+---Toggle a whole file: review every hunk (or the file-level flag for
+---non-textual changes), or reset everything back to pending.
+---@param context AgenticFlow.Context
+---@param file string
+---@return { file: string, status: "reviewed"|"pending" }?, string?
+function M.toggle_file(context, file)
+  local change = context.by_file[file]
+  if not change then
+    return nil, "the file is not part of this review"
+  end
+
+  local reviewed = M.file_status(context, file) ~= "reviewed"
+  set_file_reviewed(context, file, change, reviewed)
+  if not save(context) then
+    return nil, "could not persist reviewed state"
+  end
+  return { file = file, status = reviewed and "reviewed" or "pending" }
+end
+
+---Toggle a **directory**: exactly pressing `r` on every file beneath it, at
+---any depth. A directory that is not fully reviewed is marked, a fully
+---reviewed one is unmarked — never file-by-file inversion, which would turn a
+---partial directory into its photographic negative.
+---
+---The directory itself holds no review state; only the files move, and one
+---`save` covers all of them.
+---@param context AgenticFlow.Context
+---@param directory string
+---@return { directory: string, status: "reviewed"|"pending", files: string[] }?, string?
+function M.toggle_directory(context, directory)
+  local files = M.directory_files(context, directory)
+  if #files == 0 then
+    return nil, "the directory has no files in this review"
+  end
+
+  local reviewed = M.directory_status(context, directory) ~= "reviewed"
+  for _, file in ipairs(files) do
+    set_file_reviewed(context, file, context.by_file[file], reviewed)
+  end
+  if not save(context) then
+    return nil, "could not persist reviewed state"
+  end
+  return {
+    directory = directory,
+    status = reviewed and "reviewed" or "pending",
+    files = files,
+  }
+end
+
+---@param context AgenticFlow.Context
+---@return { file_index: integer, file: string, change: AgenticFlow.Change, hunk: AgenticFlow.Hunk, line: integer }[]
 local function unreviewed_hunks(context)
   local items = {}
   for file_index, change in ipairs(context.changes) do
@@ -508,6 +514,9 @@ local function unreviewed_hunks(context)
   return items
 end
 
+---@param context AgenticFlow.Context
+---@param file string
+---@return integer?
 local function current_file_index(context, file)
   for index, change in ipairs(context.changes) do
     if change.file == file then
@@ -516,12 +525,19 @@ local function current_file_index(context, file)
   end
 end
 
-local function navigation_target(context, file, line, direction)
+---Pick the next/previous unreviewed hunk relative to `(file, line)`,
+---wrapping across files. Pure data — the caller opens buffers.
+---@param context AgenticFlow.Context
+---@param file? string
+---@param line integer
+---@param direction "next"|"previous"
+---@return { file_index: integer, file: string, change: AgenticFlow.Change, hunk: AgenticFlow.Hunk, line: integer }?, string?
+function M.navigation_target(context, file, line, direction)
   local items = unreviewed_hunks(context)
   if #items == 0 then
-    return nil
+    return nil, "there are no unreviewed hunks"
   end
-  local file_index = current_file_index(context, file)
+  local file_index = file and current_file_index(context, file) or nil
   if direction == "previous" then
     for index = #items, 1, -1 do
       local item = items[index]
@@ -547,75 +563,46 @@ local function navigation_target(context, file, line, direction)
   return items[1]
 end
 
----@param config table
----@param opts? table
----@param direction "next"|"previous"
----@return table?, string?
-function M.navigate_unreviewed(config, opts, direction)
-  opts = opts or {}
-  local seed = opts.context
-  local context = seed
-  if not context then
-    local err
-    context, err = M.resolve(config, {
-      root = opts.root,
-      base = opts.base,
-      buf = opts.buf,
-    })
-    if not context then
-      return nil, err
-    end
-  end
-
-  local file = current_file(context, opts)
-  local target = navigation_target(context, file, cursor_line(opts), direction)
-  if not target then
-    return nil, "there are no unreviewed textual chunks"
-  end
-  local buf, open_error = M.open_change(config, context, target.change, target.line)
-  if not buf then
-    return nil, open_error
-  end
-  return {
-    context = context,
-    file = target.file,
-    hunk = target.hunk,
-    buf = buf,
-  }
+---@param root string
+---@param file string
+---@return boolean
+local function exists(root, file)
+  local stat = vim.uv.fs_stat(util.absolute(root, file))
+  return stat ~= nil and stat.type == "file"
 end
 
-local function buffer_lines(context, file, buf)
-  if buf and vim.api.nvim_buf_is_valid(buf) then
-    return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+---@param context AgenticFlow.Context
+---@param file string
+---@param provided string[]?
+---@return string[]
+local function file_lines(context, file, provided)
+  if provided then
+    return provided
   end
-  local absolute = util.absolute(context.root, file)
-  local loaded = vim.fn.bufnr(absolute)
-  if loaded > 0 and vim.api.nvim_buf_is_loaded(loaded) then
-    return vim.api.nvim_buf_get_lines(loaded, 0, -1, false)
-  end
-  return util.split_lines(util.read_file(absolute) or "")
+  return util.split_lines(util.read_file(util.absolute(context.root, file)) or "")
 end
 
----@param config table
----@param opts table
----@return table?, string?, table?
-function M.create_comment(config, opts)
-  local seed = opts.context
-  local context, err = M.resolve(config, {
-    root = seed and seed.root or opts.root,
-    base = seed and seed.base or opts.base,
-    buf = opts.buf,
-  })
-  if not context then
-    return nil, err
+---Create a file-level or ranged comment. Anchor context comes from
+---`opts.lines` when given (live buffer contents), the on-disk file
+---otherwise. Binary rejection follows the change data, never how a buffer
+---was opened.
+---
+---Any file in the repository can hold a comment: annotating an unchanged
+---caller of the thing you changed is a normal act, and the result is an
+---**off-diff comment** — kept, and never flagged the way an **orphan
+---comment** is. A path that is neither in the diff nor on disk is a mistake,
+---not a deliberate note, so it is still refused.
+---@param context AgenticFlow.Context
+---@param opts { file: string, text: string, start_line?: integer, end_line?: integer, lines?: string[] }
+---@return AgenticFlow.Comment?, string?
+function M.create_comment(context, opts)
+  local file = opts.file
+  if type(file) ~= "string" or file == "" then
+    return nil, "comments need a file"
   end
-
-  local file = current_file(context, opts)
-  if not file then
-    return nil, "could not determine the file for this comment"
-  end
-  if not context.by_file[file] then
-    return nil, "comments can only be added to files in the active review"
+  local change = context.by_file[file]
+  if not change and not exists(context.root, file) then
+    return nil, "comments can only be added to files in the repository"
   end
   if type(opts.text) ~= "string" or not opts.text:match("%S") then
     return nil, "comments cannot be empty"
@@ -625,12 +612,12 @@ function M.create_comment(config, opts)
   local end_line = opts.end_line
   local anchor
   if start_line or end_line then
-    if opts.binary or (opts.buf and vim.b[opts.buf].agentic_flow_binary) then
+    if change and change.binary then
       return nil, "binary files only support file-level comments"
     end
-    local lines = buffer_lines(context, file, opts.buf)
-    start_line = math.max(1, math.min(start_line or end_line or 1, #lines))
-    end_line = math.max(1, math.min(end_line or start_line, #lines))
+    local lines = file_lines(context, file, opts.lines)
+    start_line = math.max(1, math.min(start_line or end_line or 1, math.max(1, #lines)))
+    end_line = math.max(1, math.min(end_line or start_line, math.max(1, #lines)))
     if end_line < start_line then
       start_line, end_line = end_line, start_line
     end
@@ -651,6 +638,7 @@ function M.create_comment(config, opts)
     text = opts.text,
     anchor = anchor,
     stale = false,
+    off_diff = change == nil,
     created_at = os.time(),
     updated_at = os.time(),
   }
@@ -659,9 +647,12 @@ function M.create_comment(config, opts)
   if not save(context) then
     return nil, "could not persist comment"
   end
-  return comment, nil, context
+  return comment
 end
 
+---@param context AgenticFlow.Context
+---@param id string|number
+---@return AgenticFlow.Comment? comment, AgenticFlow.FileEntry? file_entry, integer? index, string? file
 local function find_comment(context, id)
   for file, file_entry in pairs(context.session.files) do
     for index, comment in ipairs(file_entry.comments or {}) do
@@ -672,18 +663,10 @@ local function find_comment(context, id)
   end
 end
 
----@param config table
----@param opts table
----@return table?, string?, table?
-function M.update_comment(config, opts)
-  local seed = opts.context
-  local context, err = M.resolve(config, {
-    root = seed and seed.root or opts.root,
-    base = seed and seed.base or opts.base,
-  })
-  if not context then
-    return nil, err
-  end
+---@param context AgenticFlow.Context
+---@param opts { id: string|number, text: string }
+---@return AgenticFlow.Comment?, string?
+function M.update_comment(context, opts)
   local comment = find_comment(context, opts.id)
   if not comment then
     return nil, "comment not found"
@@ -696,22 +679,14 @@ function M.update_comment(config, opts)
   if not save(context) then
     return nil, "could not persist comment"
   end
-  return comment, nil, context
+  return comment
 end
 
----@param config table
----@param opts table
+---@param context AgenticFlow.Context
+---@param id string|number
 ---@return boolean, string?
-function M.delete_comment(config, opts)
-  local seed = opts.context
-  local context, err = M.resolve(config, {
-    root = seed and seed.root or opts.root,
-    base = seed and seed.base or opts.base,
-  })
-  if not context then
-    return false, err
-  end
-  local _, file_entry, index = find_comment(context, opts.id)
+function M.delete_comment(context, id)
+  local _, file_entry, index = find_comment(context, id)
   if not file_entry then
     return false, "comment not found"
   end
@@ -719,40 +694,43 @@ function M.delete_comment(config, opts)
   return save(context)
 end
 
----@param config table
----@param opts? table
+---@param context AgenticFlow.Context
 ---@return boolean, string?
-function M.clear_comments(config, opts)
-  opts = opts or {}
-  local seed = opts.context
-  local context, err = M.resolve(config, {
-    root = seed and seed.root or opts.root,
-    base = seed and seed.base or opts.base,
-  })
-  if not context then
-    return false, err
-  end
+function M.clear_comments(context)
   for _, file_entry in pairs(context.session.files) do
     file_entry.comments = {}
   end
   return save(context)
 end
 
----@param context table
----@return table[]
+---Every comment in the review, sorted in **tree order** → range, with orphan
+---flags for files that left the diff. The export reads in the same order the
+---sidebar does; a pasted prompt that disagreed with the tree would be the same
+---defect in a different window.
+---
+---Being outside the diff is not enough to orphan a comment: an **off-diff
+---comment** was placed on a file that was never in it, so nothing moved
+---under it. Only a comment that *lost* its diff membership is flagged.
+---@param context AgenticFlow.Context
+---@return AgenticFlow.Comment[]
 function M.comments(context)
   local comments = {}
   for file, file_entry in pairs(context.session.files) do
     for _, stored in ipairs(file_entry.comments or {}) do
       local comment = vim.deepcopy(stored)
       comment.path = file
-      comment.orphan = context.by_file[file] == nil
+      comment.off_diff = stored.off_diff == true
+      comment.orphan = context.by_file[file] == nil and not comment.off_diff
       comments[#comments + 1] = comment
     end
   end
+  local keys = {}
+  for _, comment in ipairs(comments) do
+    keys[comment.path] = keys[comment.path] or util.tree_key(comment.path)
+  end
   table.sort(comments, function(left, right)
     if left.path ~= right.path then
-      return left.path < right.path
+      return keys[left.path] < keys[right.path]
     end
     if (left.start_line == nil) ~= (right.start_line == nil) then
       return left.start_line == nil
@@ -768,6 +746,8 @@ function M.comments(context)
   return comments
 end
 
+---@param comment AgenticFlow.Comment
+---@return string
 local function comment_prefix(comment)
   if not comment.start_line then
     return comment.path
@@ -778,8 +758,9 @@ local function comment_prefix(comment)
   return ("%s:%d-%d"):format(comment.path, comment.start_line, comment.end_line)
 end
 
----@param context table
----@return string, number
+---Render all comments in the stable `@path:range : text` format.
+---@param context AgenticFlow.Context
+---@return string, integer
 function M.render_comments(context)
   local output = {}
   local comments = M.comments(context)
@@ -789,27 +770,22 @@ function M.render_comments(context)
   return table.concat(output, "\n\n"), #comments
 end
 
----@param config table
----@param opts? table
----@return string?, string?, number?
-function M.copy_comments(config, opts)
-  opts = opts or {}
-  local seed = opts.context
-  local context, err = M.resolve(config, {
-    root = seed and seed.root or opts.root,
-    base = seed and seed.base or opts.base,
-  })
-  if not context then
-    return nil, err
-  end
+---@param context AgenticFlow.Context
+---@param register string
+---@return string?, string?, integer?
+function M.copy_comments(context, register)
   local output, count = M.render_comments(context)
   if count == 0 then
     return nil, "there are no comments to copy"
   end
-  vim.fn.setreg(opts.register or config.clipboard, output)
+  vim.fn.setreg(register, output)
   return output, nil, count
 end
 
+---@param lines string[]
+---@param start_line integer
+---@param anchor_lines string[]
+---@return boolean
 local function block_matches(lines, start_line, anchor_lines)
   if start_line < 1 or start_line + #anchor_lines - 1 > #lines then
     return false
@@ -822,10 +798,13 @@ local function block_matches(lines, start_line, anchor_lines)
   return true
 end
 
----@param context table
+---Re-anchor `file`'s comments against fresh `lines`: exact position, then
+---unique full-file match, then context disambiguation; otherwise the comment
+---is flagged stale — never silently moved.
+---@param context AgenticFlow.Context
 ---@param file string
 ---@param lines string[]
----@return boolean
+---@return boolean changed
 function M.relocate_comments(context, file, lines)
   local file_entry = context.session.files[file]
   if not file_entry then
@@ -885,101 +864,6 @@ function M.relocate_comments(context, file, lines)
     save(context)
   end
   return changed
-end
-
-local function find_review_buffer(context, file)
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if
-      vim.api.nvim_buf_is_valid(buf)
-      and vim.b[buf].agentic_flow_root == context.root
-      and vim.b[buf].agentic_flow_path == file
-    then
-      return buf
-    end
-  end
-end
-
-local function deleted_buffer(context, change)
-  local existing = find_review_buffer(context, change.file)
-  if existing then
-    return existing
-  end
-
-  local contents, err =
-    git.file_at(context.root, context.merge_base, change.old_file or change.file)
-  if not contents then
-    return nil, err
-  end
-  local binary = contents:find("\0", 1, true) ~= nil
-  local lines = binary and { ("Binary file: %s"):format(change.file) } or util.split_lines(contents)
-  if #lines == 0 then
-    lines = { "" }
-  end
-
-  local buf = vim.api.nvim_create_buf(true, true)
-  vim.api.nvim_buf_set_name(
-    buf,
-    ("agentic-flow://deleted/%s/%s"):format(vim.fn.sha256(context.root):sub(1, 12), change.file)
-  )
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].bufhidden = "hide"
-  vim.bo[buf].swapfile = false
-  vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].readonly = true
-  vim.bo[buf].filetype = vim.filetype.match({ filename = change.file }) or ""
-  vim.b[buf].agentic_flow_binary = binary
-  return buf
-end
-
----@param config table
----@param context table
----@param change table
----@param line? number
----@return number?, string?
-function M.open_change(config, context, change, line)
-  local buf
-  if change.status == "D" or not vim.uv.fs_stat(util.absolute(context.root, change.file)) then
-    local err
-    buf, err = deleted_buffer(context, change)
-    if not buf then
-      return nil, err
-    end
-  else
-    local absolute = util.absolute(context.root, change.file)
-    buf = vim.fn.bufadd(absolute)
-    vim.fn.bufload(buf)
-    vim.b[buf].agentic_flow_binary = change.binary or false
-  end
-
-  vim.api.nvim_win_set_buf(0, buf)
-  vim.b[buf].agentic_flow_root = context.root
-  vim.b[buf].agentic_flow_base = context.base
-  vim.b[buf].agentic_flow_path = change.file
-  require("agentic-flow.ui").attach(config, context, change.file, buf)
-
-  local target = math.max(1, math.min(line or change.line or 1, vim.api.nvim_buf_line_count(buf)))
-  vim.api.nvim_win_set_cursor(0, { target, 0 })
-  return buf
-end
-
----@param config table
----@param context table
----@param comment table
----@return number?, string?
-function M.open_comment(config, context, comment)
-  local change = context.by_file[comment.path]
-  if not change then
-    local absolute = util.absolute(context.root, comment.path)
-    change = {
-      file = comment.path,
-      status = vim.uv.fs_stat(absolute) and "M" or "D",
-      line = comment.start_line or 1,
-      binary = false,
-    }
-  end
-  return M.open_change(config, context, change, comment.start_line or 1)
 end
 
 return M

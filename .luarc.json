@@ -1,9 +1,14 @@
 {
   "runtime.version": "LuaJIT",
   "workspace.checkThirdParty": false,
+  "workspace.library": [
+    "$VIMRUNTIME/lua"
+  ],
   "diagnostics.globals": [
     "vim"
   ],
+  "diagnostics.groupFileStatus": {
+    "type-check": "Any"
+  },
   "telemetry.enable": false
 }
-

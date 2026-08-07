@@ -1,175 +1,206 @@
 # agentic-flow.nvim
 
-A focused Neovim workflow for reviewing the current branch, attaching notes to files
-or selected lines, and copying those notes into an agent prompt.
+A focused Neovim workflow for reviewing a branch's changes hunk by hunk,
+attaching comments, and copying those comments into an agent prompt.
 
 ## Requirements
 
-- Neovim with `vim.system()` support
+- Neovim 0.11 or newer
 - Git
-- [snacks.nvim](https://github.com/folke/snacks.nvim) with its picker enabled
+
+There are no required UI dependencies. If `mini.icons` or `nvim-web-devicons`
+is installed, the sidebar borrows its file icons; neither is required.
 
 ## Setup
 
-Using `lazy.nvim`:
+With `lazy.nvim`:
 
 ```lua
 {
   "alzeck/agentic-flow.nvim",
-  main = "agentic-flow",
-  dependencies = {
-    {
-      "folke/snacks.nvim",
-      opts = {
-        picker = { enabled = true },
-      },
-    },
-  },
-  opts = {
-    base = "origin/main",
-    clipboard = "+",
-    picker = {},
-    branch_picker = {},
-    comments_picker = {},
-    signs = {
-      comment = "●",
-      stale = "!",
-      unreviewed = "▎",
-    },
-    display = {
-      virtual_text = true,
-      unreviewed_chunks = true,
-    },
-  },
+  lazy = false,
+  ---@module "agentic-flow"
+  ---@type AgenticFlow.UserConfig
+  opts = {},
   keys = {
-    {
-      "<leader>ro",
-      "<cmd>AgenticFlowChanges<cr>",
-      desc = "Open code review",
-    },
-    {
-      "<leader>rr",
-      "<cmd>AgenticFlowToggleReviewed<cr>",
-      desc = "Toggle all file chunks reviewed",
-    },
-    {
-      "<leader>rh",
-      "<cmd>AgenticFlowToggleChunkReviewed<cr>",
-      desc = "Toggle chunk reviewed",
-    },
-    {
-      "]r",
-      "<cmd>AgenticFlowNextUnreviewed<cr>",
-      desc = "Next unreviewed chunk",
-    },
-    {
-      "[r",
-      "<cmd>AgenticFlowPrevUnreviewed<cr>",
-      desc = "Previous unreviewed chunk",
-    },
-    {
-      "<leader>rc",
-      "<cmd>AgenticFlowComment<cr>",
-      mode = "n",
-      desc = "Comment current line",
-    },
-    {
-      "<leader>rc",
-      ":AgenticFlowComment<cr>",
-      mode = "x",
-      desc = "Comment selected lines",
-      silent = true,
-    },
-    {
-      "<leader>rf",
-      "<cmd>AgenticFlowFileComment<cr>",
-      desc = "Comment current file",
-    },
-    {
-      "<leader>rl",
-      "<cmd>AgenticFlowComments<cr>",
-      desc = "List review comments",
-    },
-    {
-      "<leader>ry",
-      "<cmd>AgenticFlowCopyComments<cr>",
-      desc = "Copy review comments",
-    },
-    {
-      "<leader>rb",
-      "<cmd>AgenticFlowBase<cr>",
-      desc = "Select review base",
-    },
+    { "<leader>ro", "<cmd>AgenticFlowChanges<cr>", desc = "Open review sidebar" },
+    { "<leader>rr", "<cmd>AgenticFlowToggleReviewed<cr>", desc = "Toggle file reviewed" },
+    { "<leader>rh", "<cmd>AgenticFlowToggleHunkReviewed<cr>", desc = "Toggle hunk reviewed" },
+    { "]r", "<cmd>AgenticFlowNextUnreviewed<cr>", desc = "Next unreviewed hunk" },
+    { "[r", "<cmd>AgenticFlowPrevUnreviewed<cr>", desc = "Previous unreviewed hunk" },
+    { "<leader>rc", "<cmd>AgenticFlowComment<cr>", mode = "n", desc = "Comment current line", },
+    { "<leader>rc", ":AgenticFlowComment<cr>", mode = "x", silent = true, desc = "Comment selected lines", },
+    { "<leader>rf", "<cmd>AgenticFlowFileComment<cr>", desc = "Add file comment" },
+    { "<leader>rl", "<cmd>AgenticFlowComments<cr>", desc = "List review comments" },
+    { "<leader>ry", "<cmd>AgenticFlowCopyComments<cr>", desc = "Copy review comments" },
+    { "<leader>rb", "<cmd>AgenticFlowBase<cr>", desc = "Select review base" },
+    { "<leader>rR", "<cmd>AgenticFlowRefresh<cr>", desc = "Refresh review" },
+    { "<leader>rd", "<cmd>AgenticFlowDiff<cr>", desc = "Toggle review diff" },
+    { "<leader>rs", "<cmd>AgenticFlowToggleSigns<cr>", desc = "Toggle review signs" },
   },
 }
 ```
 
-`picker`, `branch_picker`, and `comments_picker` are merged into their corresponding
-Snacks picker options. The changed-files picker defaults to the Snacks `sidebar`
-layout; set `picker.layout` to another preset to override it. The `keys` entries are
-Lazy load triggers, so every mapping is available before the plugin loads and loads
-it only when used.
-
 ## Review workflow
 
-Open the review:
+Review is ambient. Opening an ordinary file buffer in a Git repository resolves
+its `(repository, branch, base)` context asynchronously and attaches hunk signs
+and comment markers. No command is required first.
+
+Open the sidebar when you want the whole changed-file view:
 
 ```vim
 :AgenticFlowChanges
 ```
 
 The comparison starts at the merge-base with the selected base and ends at the
-working tree. It includes committed branch changes, staged changes, unstaged changes,
-and untracked files.
+working tree. It includes committed branch changes, staged and unstaged changes,
+renames, deletions, binary files, and untracked files.
 
-The review opens as a persistent left sidebar with one row per changed file:
+The sidebar is one nested, collapsible tree in tree order: directories before
+sibling files at every level, each group by name, a directory's contents
+immediately below it. Unreviewed-hunk navigation and comment export travel the
+same order, so the sidebar reads top to bottom exactly as
+`AgenticFlowNextUnreviewed` moves. Files
+never move when their state changes:
 
-- `○` needs review
-- `◐` partly reviewed
-- `✓` reviewed
-- `↻` changed since it was reviewed
+- pending `○`
+- partial `◐ n/m`
+- invalidated `↻`
+- reviewed `✓`, rendered dimmed
 
-Picker actions are available in the input and list windows:
+Directories derive the same status from all changed descendants and show an
+`n/m` badge. `↻` takes precedence and propagates through collapsed ancestors.
+Pressing `r` on a directory marks or unmarks every changed file below it,
+recursively. Unmarking more than five files asks for confirmation because review
+timestamps cannot be recovered.
 
-| Action | Input | List |
-| --- | --- | --- |
-| Toggle reviewed | `<C-r>` | `r` |
-| Add file note | `<C-n>` | `c` |
-| Select base | `<C-b>` | `b` |
-| List comments | `<C-l>` | `l` |
-| Copy comments | `<C-y>` | `y` |
+The sidebar behaves as a list rather than a document: a mouse wheel notch moves
+the selection by `mousescroll` entries — whether or not the sidebar has focus —
+and nothing scrolls past the last entry.
 
-Press `<CR>` to open a changed file at its first changed line in the main editing
-window. The sidebar stays open so you can move through the rest of the review.
-Deleted files open their base contents in a read-only buffer. Binary files support
-file-level notes but not line selections.
+Files with off-diff comments appear at their normal path position with a comment
+marker and no review-status glyph. They do not affect directory or title
+progress.
 
-Textual changes are divided into Git diff chunks. Each unreviewed chunk has a subtle
-changed-line tint and a `▎` gutter marker. Partly reviewed sidebar rows show their
-reviewed/total chunk count.
+Review state follows content-based hunk fingerprints, so unchanged hunks remain
+reviewed after code moves while edited or new hunks return to review.
 
-Toggle the chunk under the cursor:
+Tree mappings:
+
+| Key | Action |
+| --- | --- |
+| `<CR>` | Open the first unreviewed hunk; retarget a sticky diff; toggle a directory |
+| `r` | Toggle the selected file or directory reviewed |
+| `h` | Collapse or expand a directory |
+| `c` | Add a file-level comment |
+| `b` | Select and remember the comparison base |
+| `l` | Open the comments list |
+| `y` | Copy all comments |
+| `D` | Toggle sticky diff mode |
+| `R` | Refresh |
+| `q` | Close the sidebar |
+
+## Signs and freshness
+
+Changed lines use gitsigns-style extmark signs in any buffer whose context can be
+resolved:
+
+- additions: green `▎`
+- modifications: blue `▎`
+- deletion anchors: red `_`
+- reviewed changes: dim `▎`
+- comments: `●`; stale comments: `!`
+
+`display.hunk_signs = "review_only"` limits automatic decoration to buffers
+opened through the plugin. `:AgenticFlowToggleSigns` is a session kill switch:
+turning it off removes all hunk and comment extmarks and stops the watcher;
+turning it back on reattaches and refreshes without changing stored review state.
+
+Review resolution and Git commands are asynchronous. The tree displays `⟳` while
+a resolve is in flight. Refreshes come from:
+
+- `BufWritePost` beneath the review root
+- a debounced filesystem watcher for the worktree, Git index, HEAD, and refs
+- `FocusGained`
+- `R` or `:AgenticFlowRefresh`
+
+Exactly one filesystem watcher follows the repository of the most recent
+ordinary file buffer. Background contexts hold no handles or autocmds. Parsed
+contexts are cached least-recently-used up to `context_cap` (default `8`);
+foreground and buffer-attached contexts are never evicted.
+
+macOS uses recursive filesystem events. libuv does not provide recursive
+`fs_event` support on Linux, so Linux watches the root non-recursively and relies
+on buffer writes and focus changes for nested directories.
+
+## Sticky diff mode
+
+Toggle the built-in before/after diff:
 
 ```vim
-:AgenticFlowToggleChunkReviewed
+:AgenticFlowDiff
 ```
 
-Move through every unreviewed chunk in the review. Navigation continues across files
-and wraps at either end:
+The left side is a read-only merge-base scratch and the right side is the real
+working-tree buffer. Added and untracked files compare against an empty before
+side; deleted files compare against an empty after side.
+
+Diff mode is sticky: tree `<CR>` and next/previous navigation replace both buffers
+inside the existing split. Review commands work on either side. Before-side
+mapping from old lines to new-side hunks is intentionally experimental and may
+change after real-world use.
+
+## Comments
+
+Add a comment to the current or selected lines:
 
 ```vim
-:AgenticFlowNextUnreviewed
-:AgenticFlowPrevUnreviewed
+:AgenticFlowComment
+:'<,'>AgenticFlowComment
 ```
 
-Use `:AgenticFlowToggleReviewed` or sidebar `r` to mark every chunk in a file
-reviewed, or reset them all to pending. A modified buffer must be saved before a
-chunk can be reviewed.
+Add a file-level comment:
 
-Chunk identities are content-based. If a reviewed file changes, unchanged chunks
-stay reviewed while edited or newly added chunks return to review. Binary,
-rename-only, and other changes without textual hunks retain file-level review state.
-Set `display.unreviewed_chunks = false` to disable editor highlighting.
+```vim
+:AgenticFlowFileComment
+```
+
+The multiline Markdown editor saves with `:write` or `<C-s>`. Press `q` to close
+an unchanged editor or `:q!` to discard edits.
+
+Open the comments list:
+
+```vim
+:AgenticFlowComments
+```
+
+List mappings:
+
+| Key | Action |
+| --- | --- |
+| `<CR>` | Jump to the relocated comment line |
+| `e` | Edit |
+| `d` | Delete |
+| `D` | Clear all after confirmation |
+| `y` | Copy all |
+| `q` | Close |
+
+Inline comments retain source context and relocate when their code moves. Unsafe
+or ambiguous anchors are preserved as `[stale]`; comments whose files leave the
+diff are preserved as `[orphan]`.
+
+Comments can also be added deliberately to unchanged files. These off-diff
+comments are session-scoped, unflagged, shown in the sidebar and comments list,
+decorated in their source buffer, and included in copied output.
+
+Copy output uses stable Codex file references, with blank lines between comments:
+
+```text
+@lua/agentic-flow/init.lua:12-18 : Keep this validation local.
+
+@lua/agentic-flow/tree.lua : Consider the empty review state.
+```
 
 ## Comparison base
 
@@ -179,146 +210,81 @@ Pick a local or remote branch without checking it out:
 :AgenticFlowBase
 ```
 
-The last selection is remembered per current branch. `base` from `setup()` is the
-fallback for branches without a remembered selection.
+The selection is remembered per current branch. With no remembered selection,
+the plugin tries a configured `base`, then `origin/HEAD`, `origin/main`, and
+`origin/master`. An inferred base is shown as guessed in the sidebar and is never
+persisted. If nothing resolves, ambient decoration stays silent and the first
+explicit command opens the base picker.
 
-Use a ref for one review directly:
+Pass a base while opening the sidebar to select and remember it. The sidebar and
+gutter re-key together:
 
 ```vim
 :AgenticFlowChanges origin/develop
 ```
 
-Remote refs are read locally; the plugin does not fetch them.
+The plugin reads local refs and never fetches or checks out the selected branch.
 
-## Comments
+## Commands
 
-Without a range, a comment applies to the current line:
-
-```vim
-:AgenticFlowComment
-```
-
-Select code in visual mode and run the same command to attach the note to the
-inclusive line range:
-
-```vim
-:'<,'>AgenticFlowComment
-```
-
-Use the explicit file command for a note that applies to the whole file:
-
-```vim
-:AgenticFlowFileComment
-```
-
-A small multiline editor opens for the note. Save with `:write` or `<C-s>`. Close an
-unchanged editor with `q`, or discard edits with `:q!`.
-
-Inline comments use source context to stay attached when code moves. If the selected
-code changes or no longer has one safe match, the note remains available and is
-marked stale. Notes for files that leave the diff are retained and marked orphaned.
-
-List, preview, jump to, edit, delete, or clear comments:
-
-```vim
-:AgenticFlowComments
-```
-
-| Action | Input | List |
-| --- | --- | --- |
-| Edit | `<C-e>` | `e` |
-| Delete | `<C-d>` | `d` |
-| Clear all | `<C-x>` | `D` |
-| Copy all | `<C-y>` | `y` |
-
-Clearing all comments requires confirmation. Deleting one comment is immediate.
-
-## Prompt output
-
-Copy every comment in the active branch/base review:
-
-```vim
-:AgenticFlowCopyComments
-```
-
-Comments are sorted by file and line range and copied to the configured `clipboard`
-register. File-level notes sort before inline notes:
-
-```text
-@lua/agentic-flow/init.lua:12-18 : Extract this validation into a helper.
-Keep the public error message unchanged.
-
-@lua/agentic-flow/init.lua : Add module-level documentation.
-```
-
-The `@` prefix makes each path a Codex file reference. Blank lines separate review
-items, while multiline comments remain unchanged. Stale and orphan labels are UI-only
-and are not added to the copied text.
-
-## Lazy keymaps
-
-Mappings belong in the `keys` field of the `lazy.nvim` plugin spec, as shown in
-[Setup](#setup). They are registered by Lazy rather than as side effects of
-`setup()`, which keeps them available even when the plugin has not loaded yet.
-
-| Mapping | Action |
+| Command | Purpose |
 | --- | --- |
-| `<leader>ro` | Open the changed-files review |
-| `<leader>rr` | Toggle every chunk in the current file |
-| `<leader>rh` | Toggle the chunk under the cursor |
-| `]r` | Open the next unreviewed chunk |
-| `[r` | Open the previous unreviewed chunk |
-| `<leader>rc` | Comment the current line, or the selected lines in visual mode |
-| `<leader>rf` | Add a file-level comment |
-| `<leader>rl` | List comments |
-| `<leader>ry` | Copy comments |
-| `<leader>rb` | Select the base |
+| `AgenticFlowChanges [base]` | Open the review sidebar; optionally select its base |
+| `AgenticFlowBase` | Select the comparison base |
+| `AgenticFlowToggleReviewed` | Toggle every hunk in the current file |
+| `AgenticFlowToggleHunkReviewed` | Toggle the hunk under the cursor |
+| `AgenticFlowNextUnreviewed` | Navigate to the next unreviewed hunk |
+| `AgenticFlowPrevUnreviewed` | Navigate to the previous unreviewed hunk |
+| `AgenticFlowComment` | Add a line/range comment |
+| `AgenticFlowFileComment` | Add a file-level comment |
+| `AgenticFlowComments` | Open the comments list |
+| `AgenticFlowCopyComments` | Copy every review comment |
+| `AgenticFlowRefresh` | Refresh the current review context |
+| `AgenticFlowToggleSigns` | Toggle all review decoration for this session |
+| `AgenticFlowDiff` | Toggle sticky diff mode |
 
-Change or remove entries directly in `keys` to customize the mappings. No
-`keymaps` setup option or `lazy = false` setting is needed.
+## Lua API
+
+```lua
+local flow = require("agentic-flow")
+
+flow.changes({ base = "origin/develop" })
+flow.select_base()
+flow.toggle_reviewed()
+flow.toggle_hunk_reviewed()
+flow.next_unreviewed()
+flow.prev_unreviewed()
+flow.add_comment()
+flow.comments()
+flow.copy_comments({ register = "+" })
+flow.refresh()
+flow.toggle_signs()
+flow.toggle_diff()
+```
+
+`add_comment()` also accepts `file`, `start_line`, `end_line`, `file_level`, and
+`text`. Supplying `text` creates the comment directly instead of opening the
+editor.
 
 ## Persistence
 
-Review sessions are versioned JSON stored beneath the repository path returned by:
+Review sessions use schema v3 beneath the repository path returned by:
 
 ```sh
 git rev-parse --git-path agentic-flow
 ```
 
-State is isolated by current branch and comparison base, survives Neovim restarts,
-works with Git worktrees, and never appears as a tracked worktree file.
-
-## Lua API
-
-```lua
-local review = require("agentic-flow")
-
-review.changes({ base = "origin/develop" })
-review.select_base()
-review.toggle_reviewed()
-review.toggle_chunk_reviewed()
-review.next_unreviewed()
-review.prev_unreviewed()
-review.add_comment()
-review.comments()
-review.copy_comments({ register = "+" })
-```
-
-`add_comment()` also accepts `file`, `start_line`, `end_line`, `file_level`, and
-`text` for programmatic use. Passing `file_level = true` creates a file-level note.
+State is isolated by `(branch, base)`, written atomically, and survives Neovim
+restarts and Git worktrees. Newer schemas open read-only; corrupt or older schema
+files are preserved before a fresh session is created.
 
 ## Development
 
-The development toolchain requires
-[Lua Language Server](https://luals.github.io/) and
-[StyLua](https://github.com/JohnnyMorganz/StyLua) on `PATH`.
+The development toolchain requires Neovim 0.11+, Git, Lua Language Server, and
+StyLua:
 
 ```sh
 make lint
 make format
 make test
 ```
-
-`make lint` runs Lua Language Server diagnostics and verifies StyLua formatting.
-`make format` formats all plugin Lua sources.
-`make test` runs the test suite in an isolated temporary Git repository.
