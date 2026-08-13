@@ -11,6 +11,7 @@ local M = {}
 ---@field label string
 ---@field text? string
 ---@field on_save fun(text: string): boolean?, string?
+---@field on_copy? fun(text: string): boolean?, string?
 
 ---@class AgenticFlow.CommentDraft
 ---@field file string
@@ -235,6 +236,24 @@ function M.editor(opts)
     end
   end
 
+  -- Copying yields the note without persisting it, so it never runs on_save.
+  local function copy_comment()
+    local contents = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    if not contents:match("%S") then
+      util.notify("Comments cannot be empty", vim.log.levels.WARN)
+      return
+    end
+    local ok, err = opts.on_copy(contents)
+    if ok == false then
+      util.notify(err or "Could not copy comment", vim.log.levels.ERROR)
+      return
+    end
+    vim.bo[buf].modified = false
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+
   vim.api.nvim_create_autocmd("BufWriteCmd", {
     buffer = buf,
     callback = save_comment,
@@ -244,6 +263,13 @@ function M.editor(opts)
     desc = "Save review note",
     silent = true,
   })
+  if opts.on_copy then
+    vim.keymap.set({ "n", "i" }, "<C-y>", copy_comment, {
+      buffer = buf,
+      desc = "Copy review note",
+      silent = true,
+    })
+  end
   vim.keymap.set("n", "q", function()
     if vim.bo[buf].modified then
       util.notify("Save with :write or discard with :q!", vim.log.levels.WARN)
@@ -270,8 +296,14 @@ function M.create(config, context, opts)
     end_line = opts.end_line,
   })
   local key = context.key
+  local register = config.clipboard
   return M.editor({
     label = label,
+    on_copy = function(text)
+      vim.fn.setreg(register, "@" .. label .. " : " .. text)
+      util.notify("Review comment copied")
+      return true
+    end,
     on_save = function(text)
       if not pipeline.get(key) then
         return false, "the review context is no longer cached"
@@ -295,10 +327,17 @@ function M.edit()
     return nil
   end
   local key = list.key
+  local label = range_label(comment)
+  local register = list.config.clipboard
   return M.editor({
     id = comment.id,
-    label = range_label(comment),
+    label = label,
     text = comment.text,
+    on_copy = function(text)
+      vim.fn.setreg(register, "@" .. label .. " : " .. text)
+      util.notify("Review comment copied")
+      return true
+    end,
     on_save = function(text)
       if not pipeline.get(key) then
         return false, "the review context is no longer cached"

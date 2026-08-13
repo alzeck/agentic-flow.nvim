@@ -166,8 +166,10 @@ Add a file-level comment:
 :AgenticFlowFileComment
 ```
 
-The multiline Markdown editor saves with `:write` or `<C-s>`. Press `q` to close
-an unchanged editor or `:q!` to discard edits.
+The multiline Markdown editor saves with `:write` or `<C-s>`. Press `<C-y>` to
+copy the comment as a single `@path:range : text` entry to the clipboard
+register and close the editor without adding it to the review. Press `q` to
+close an unchanged editor or `:q!` to discard edits.
 
 Open the comments list:
 

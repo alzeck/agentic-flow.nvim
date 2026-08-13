@@ -128,6 +128,27 @@ assert_equal(vim.fn.getreg("a"), copied, "copy writes the configured register")
 assert_contains(copied, "@b.txt : Updated file note", "copy retains the prompt format")
 assert_contains(copied, "@c.txt:2 : Off-diff note", "off-diff comments are copied too")
 
+-- `<C-y>` in the editor yields one entry to the register without persisting it.
+local before = #review.comments(assert(pipeline.get(context.key)))
+local copy_editor =
+  comments_ui.create(config, context, { file = "a.txt", start_line = 1, end_line = 3 })
+local copy_win = vim.fn.bufwinid(copy_editor)
+vim.api.nvim_buf_set_lines(copy_editor, 0, -1, false, { "Copy me", "second line" })
+local mapping = vim.fn.maparg("<C-y>", "n", false, true)
+assert_equal(type(mapping.callback), "function", "the editor maps <C-y>")
+mapping.callback()
+assert_equal(
+  vim.fn.getreg("a"),
+  "@a.txt:1-3 : Copy me\nsecond line",
+  "copying writes the single-entry format to the configured register"
+)
+assert_equal(
+  #review.comments(assert(pipeline.get(context.key))),
+  before,
+  "copying does not add the comment to the review"
+)
+assert_equal(vim.api.nvim_win_is_valid(copy_win), false, "copying closes the editor")
+
 comments_ui.close()
 assert_equal(comments_ui.is_open(), false, "the comments list closes")
 pipeline.close(context.key)
